@@ -1,0 +1,32 @@
+# MediaMTX 流媒体服务器配置（运行于 WSL）
+# MediaMTX 是轻量级实时媒体服务器，支持 RTSP / RTMP / WebRTC / HLS
+# 本项目用作中间桥接：接收板端推送的 H.264 流，转发给浏览器/客户端
+
+logLevel: info
+
+# --- RTSP 服务 ---
+rtsp: yes                          # 启用 RTSP（板端推送 + 客户端拉流）
+rtspAddress: :8554                 # 监听所有接口的 8554 端口（RTSP 备用端口，避开 554 系统端口）
+rtspTransports: [tcp]              # 仅 TCP 传输，可靠且避免 UDP 丢包导致花屏
+
+# --- 按需关闭不必要的协议 ---
+hls: no                            # 不需 HLS，RTSP + WebRTC 已满足需求
+srt: no                            # 不需 SRT，减少服务开销
+
+# --- WebRTC 服务（浏览器低延迟预览）---
+webrtc: yes
+webrtcAddress: :8889               # WebRTC HTTP API 端口（浏览器信令连接）
+webrtcLocalUDPAddress: :8189       # WebRTC 媒体 UDP 端口
+# 额外候选地址：告诉浏览器该 IP 也可连接（NAT 穿透用）
+webrtcAdditionalHosts: [192.168.137.1]
+
+# --- 路径（流）路由定义 ---
+paths:
+  # camera 路径：接收板端转发的摄像头原始流
+  camera:
+    source: publisher              # 被动接收发布者推送（非主动拉取源）
+    overridePublisher: yes         # 允许新发布者覆盖旧连接（服务重启自动恢复）
+  # result 路径：接收板端编码后的马赛克结果画面
+  result:
+    source: publisher
+    overridePublisher: yes

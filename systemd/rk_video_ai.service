@@ -1,0 +1,37 @@
+# systemd service unit: RK3568 双路视频三模型推理服务
+# 安装路径: /etc/systemd/system/rk_video_ai.service
+
+[Unit]
+Description=RK3568 dual-video three-model inference service
+# 等待网络就绪、MQTT Broker 和 3A 服务完成初始化后再启动本服务
+After=network-online.target mosquitto.service rkaiq_3A.service
+Wants=network-online.target mosquitto.service rkaiq_3A.service
+# /userdata 必须为独立挂载分区，防止误用根文件系统（根分区可能为只读或空间不足）
+RequiresMountsFor=/userdata
+ConditionPathIsMountPoint=/userdata
+
+[Service]
+Type=simple
+# 工作目录设为可执行文件所在目录，相对路径（config/model 等）基于此解析
+WorkingDirectory=/userdata/rk3568_inspection_terminal/bin
+# 传感器配置文件路径，通过环境变量注入，程序启动时读取
+Environment=EDGE_SENSOR_CONFIG=/userdata/rk3568_inspection_terminal/config/sensors.ini
+# 可选的环境变量覆盖文件，前缀 "-" 表示文件不存在时不报错
+EnvironmentFile=-/etc/default/rk3568-inspection
+# 启动前等待 10 秒，确保网络、MQTT Broker 等依赖服务完全就绪
+ExecStartPre=/bin/sleep 10
+ExecStart=/userdata/rk3568_inspection_terminal/bin/rk3568_inspection_terminal
+# 仅在异常退出时重启（非零退出码或信号终止），正常退出不重启
+Restart=on-failure
+RestartSec=10                    # 重启间隔 10 秒，防止频繁震荡
+TimeoutStopSec=30                # 停止超时 30 秒，预留时间给录像保存和 MQTT 断开
+KillSignal=SIGTERM               # 先发送 SIGTERM（可被捕获用于优雅退出），超时后 SIGKILL
+LimitNOFILE=4096                 # 最大文件描述符数（RTSP/V4L2/SQLite 等需要较多 fd）
+LimitRTPRIO=99                   # 允许最高实时优先级 99（视频关键路径需要 RR 调度）
+LimitMEMLOCK=infinity            # 不限制内存锁定（mlockall 需要锁定全部内存页）
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# 默认不自动开机启动，避免开机卡死。需要可取消注释：
+# WantedBy=multi-user.target

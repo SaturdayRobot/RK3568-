@@ -1,0 +1,53 @@
+# Editors and local workspace state
+.history/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Credentials and machine-local configuration
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+.env
+.env.*
+!.env.example
+auto.crt
+
+# Build and packaging artifacts
+build/
+build-*/
+cmake-build-*/
+deploy/*/
+deploy/*.tar.gz
+deploy/*.zip
+deploy/SHA256SUMS
+*.o
+*.obj
+*.a.tmp
+*.so.tmp
+
+# Runtime state, diagnostics and crash dumps
+*.log
+log/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+core
+core.*
+
+# RKNN export intermediates (deployable .rknn models are retained)
+check*_*.onnx
+model/rk3568/*.onnx
+model/rk3568/*_dataset.txt
+model/rk3568/calibration/
+
+# Local documents
+docs/

@@ -1,0 +1,17 @@
+person
+ignore
+ignore
+ignore
+ignore
+ignore
+ignore
+ignore
+ignore
+ignore
+helmet
+ignore
+ignore
+ignore
+ignore
+safety-suit
+ignore

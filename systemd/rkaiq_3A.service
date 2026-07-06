@@ -1,0 +1,22 @@
+# systemd service unit: Rockchip RKAIQ 3A 服务
+# 安装路径: /etc/systemd/system/rkaiq_3A.service
+# 3A = Auto Exposure(自动曝光) + Auto White Balance(自动白平衡) + Auto Focus(自动对焦)
+# 该服务必须在主推理服务之前启动，确保摄像头图像质量参数已就绪
+
+[Unit]
+Description=Rockchip RKAIQ 3A service for IMX415
+After=local-fs.target                  # 等待本地文件系统挂载（需读取 IQ 校准文件）
+Before=rk_video_ai.service             # 先于主推理服务启动
+ConditionPathExists=/usr/bin/rkaiq_3A_server                     # 3A 服务器必须存在
+ConditionPathExists=/etc/iqfiles/imx415_CMK-OT1522-FG3_CS-P1150-IRC-8M-FAU.json  # IQ 校准文件
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/rkaiq_3A_server
+Restart=on-failure
+RestartSec=2                           # 快速重启（2 秒），3A 是关键基础服务
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target             # 多用户模式自动启动
