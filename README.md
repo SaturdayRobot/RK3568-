@@ -611,5 +611,3 @@ df -h /userdata/rk3568_inspection_terminal/data/records
 export LD_LIBRARY_PATH=/userdata/rk3568_inspection_terminal/lib:$LD_LIBRARY_PATH
 ldd /userdata/rk3568_inspection_terminal/bin/rk3568_inspection_terminal | grep 'not found'
 ```
-
-完整板端与 WSL 操作见 [部署手册](docs/RK3568与WSL部署操作手册.md)，事件录像设计与实现边界见 [事件预录制评估](docs/事件预录制方案评估与实现说明.md)。
