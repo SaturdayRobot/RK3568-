@@ -31,6 +31,66 @@ RK3568 IMX415 -> V4L2 NV12 DMA-BUF -------------+   -> RGA 1920x1080 mosaic
 - SQLite、MQTT、事件录像、温控和运行统计；
 - MediaMTX、Mosquitto、RKAIQ 开机自启，主程序按要求手动启动。
 
+## 板端运行环境与依赖
+
+本项目当前适配并验证的板端基线如下。更换系统镜像、内核或 NPU 组件后，需重新确认
+RKNPU 驱动、RKNN Runtime、RKNN Server 和 `.rknn` 模型之间的兼容性。
+
+### 硬件与系统
+
+| 项目 | 当前配置 |
+|---|---|
+| 板卡厂商 | 正点原子（ALIENTEK） |
+| 板卡型号 | `ATK-DLRK3568` |
+| SoC | Rockchip RK3568，四核 ARM Cortex-A55，内置 1 TOPS NPU |
+| 板载摄像头 | IMX415，V4L2 NV12 multiplanar，配合 RKAIQ 3A |
+| CPU 架构 | `aarch64` / ARM64 |
+| 板端系统 | Debian GNU/Linux 11（bullseye） |
+| Linux 内核 | `5.10.160`，Rockchip `rockchip_linux_defconfig` |
+| 板级 SDK 配置 | `alientek_rk3568_defconfig`，DTS `rk3568-atk-evb1-ddr4-v10-linux` |
+| 默认部署目录 | `/userdata/rk3568_inspection_terminal` |
+
+### NPU 版本基线
+
+| 组件 | 版本 | 说明 |
+|---|---:|---|
+| RKNPU 内核驱动（NPU Driver） | `0.9.8` | 随当前 `5.10.160` 板端内核/boot 镜像提供 |
+| RKNN Runtime（`librknnrt.so`） | `2.3.2` | 项目打包并链接的 Linux/aarch64 运行库 |
+| RKNN Server | `2.3.2` | 板端 RKNN 服务版本，应与 Runtime 保持一致 |
+| RKNN 模型目标平台 | `rk3568` | 三个 INT8 模型均需以该目标平台导出 |
+
+仓库中的 `librknnrt.so` 来自 RKNPU2 SDK 2.3.2，内部版本为
+`2.3.2 (429f97ae6b@2025-04-09T09:09:27)`。不要混用旧版 `librknn_api.so`，
+也不要只替换 Runtime 或 Server 中的一个；模型转换工具、Runtime、Server 与驱动不兼容时，
+可能出现模型加载失败、版本不匹配或推理异常。
+
+### 主要用户态依赖
+
+| 依赖 | 当前版本/来源 | 用途 |
+|---|---|---|
+| RKNN Runtime | `2.3.2`，仓库 `lib/rknn/` | NPU 推理 |
+| Rockchip MPP | 仓库 `lib/mpp/` | H.264 硬件编解码 |
+| Rockchip RGA | im2d API `1.10.1`，仓库 `lib/rga/` | 缩放、色彩转换与画面合成 |
+| OpenCV | `4.5.1`，Debian 11/aarch64 | 图像处理与后处理 |
+| FFmpeg libraries | `4.3.1`（libavcodec 58.91.100） | MPEG-TS 解复用及媒体处理 |
+| SQLite 3 | Debian 11/aarch64 | 本地结构化数据存储 |
+| Mosquitto | `2.0.11` | 本机 MQTT Broker 与消息发布 |
+| RKAIQ | 随板卡 Rockchip SDK/系统镜像提供 | IMX415 ISP 与 3A |
+
+可在板端复核实际运行环境：
+
+```bash
+tr -d '\0' </proc/device-tree/model; echo
+cat /etc/os-release
+uname -m && uname -r
+cat /sys/kernel/debug/rknpu/version 2>/dev/null || \
+  cat /proc/rknpu/version 2>/dev/null
+/userdata/rk3568_inspection_terminal/scripts/board_hardware_status.sh
+```
+
+第三方库的目录结构、获取方式和 RKNN Runtime 校验值见
+[`lib/README.md`](lib/README.md)。
+
 ## 目录
 
 | 路径 | 内容 |
