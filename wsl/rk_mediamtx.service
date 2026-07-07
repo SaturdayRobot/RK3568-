@@ -1,0 +1,15 @@
+[Unit]
+Description=RK3568 MediaMTX relay for final result stream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/RK3568_workspace/wsl/start_mediamtx.sh
+Restart=always
+RestartSec=1
+TimeoutStopSec=5
+
+[Install]
+WantedBy=default.target

@@ -112,7 +112,7 @@ VisibleRtspPipeline::~VisibleRtspPipeline() {
 
 /**
  * @brief 设置帧回调函数
- * @param cb 帧回调函数，签名为 void(const cv::Mat&, time_point, int64_t, FrameOverlay&)
+ * @param cb 帧回调函数，传递NV12 DMA描述符、时间戳和叠加元数据
  *
  * 处理后的每一帧都会通过此回调传给 FrameHub 进行后续分发。
  */
@@ -220,37 +220,16 @@ bool VisibleRtspPipeline::start() {
     loader_options.rtsp_transport = config_.loader_rtsp_transport;     // RTSP 传输协议
     loader_->configureRuntime(loader_options); // 应用运行时配置
 
-    // 尝试首次打开流（失败不阻止启动，由后台线程负责重连）
-    const bool initially_open = loader_->open() == 0;
-    if (!initially_open) {
-        std::cerr << "[VisRtspPipeline] Source is offline at startup; background reconnect enabled: "
-                  << config_.url << std::endl;
-    }
-
     // 步骤 5: 激活执行线程
     running_ = true; // 设置运行标志（必须在创建线程之前）
 
     // ---- 线程池 A: 负责底层码流拉取与 MPP 硬件解码（生产者） ----
-    loader_thread_ = std::thread([this, initially_open]() {
+    loader_thread_ = std::thread([this]() {
         // 设置线程运行时属性：CPU 亲缘性绑定 + 调度策略
         utils::applyThreadRuntime("rtsp_loader", "rtsp-loader");
         if (loader_) {
-            int backoff_ms = 1000; // 重连退避起始间隔（1 秒）
-            if (!initially_open) {
-                // 首次打开失败时进入重连循环
-                while (running_.load() && loader_->open() != 0) {
-                    // 使用退避间隔的分段 sleep 以便及时响应 stop()
-                    const auto deadline = std::chrono::steady_clock::now() +
-                                          std::chrono::milliseconds(backoff_ms);
-                    while (running_.load() && std::chrono::steady_clock::now() < deadline)
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 每 100ms 检查一次
-                    // 指数退避：每次失败将等待时间翻倍，最大 30 秒
-                    backoff_ms = std::min(backoff_ms * 2, 30000);
-                }
-            }
-            if (!running_.load()) return; // 启动期间被 stop，退出
-            // 调用 StreamLoader 的函数对象（重载了 operator()）
-            // 此调用会阻塞，持续拉流 + 解码直到出错或停止
+            // open/read/reconnect 全部在本线程执行。TCP listener 等待 Windows
+            // 连接时不会阻塞 IMX415、Mosaic 或主程序生命周期。
             (*loader_)();
         }
     });
@@ -332,6 +311,9 @@ void VisibleRtspPipeline::stop() {
  */
 void VisibleRtspPipeline::processingLoop() {
     auto last_submit = std::chrono::steady_clock::time_point{}; // 上次提交推理的时间
+    int64_t pts_anchor_us = -1;
+    int64_t mono_anchor_ns = 0;
+    int64_t last_pts_us = -1;
     while (running_) {
         // ---- 检查拉流器是否有效 ----
         if (!loader_) {
@@ -365,36 +347,52 @@ void VisibleRtspPipeline::processingLoop() {
         ScopedTimer total_timer(metrics_.last_total_us);           // 计时：处理总耗时
 
         // ---- 记录帧时间戳 ----
-        const auto now = std::chrono::steady_clock::now();                          // 单调时钟（用于计算间隔）
-        const auto timestamp = std::chrono::system_clock::now();                    // 系统时钟（对外时间戳）
-        const int64_t capture_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()).count();                                        // 纳秒级采集时间
-
-        // ---- RGA 硬件转换器初始化（thread_local，仅首次或尺寸变化时初始化） ----
-        static thread_local RgaPreprocessor converter;  // thread_local 避免多线程竞争
-        static thread_local int converter_w = 0;        // 缓存的源帧宽度
-        static thread_local int converter_h = 0;        // 缓存的源帧高度
-        static thread_local bool converter_ready = false; // 转换器就绪标志
-        if (!converter_ready || converter_w != hw_desc.width || converter_h != hw_desc.height) {
-            // 配置 RGA：NV12 → BGR888，严格硬件模式（无 CPU 回退）
-            RgaPreprocessConfig cfg;
-            cfg.use_rga = true;                    // 启用 RGA
-            cfg.strict_hardware = true;             // 严格硬件模式
-            cfg.src_format = RgaPixelFormat::NV12;  // 源格式：NV12（MPP 解码输出）
-            cfg.dst_format = RgaPixelFormat::BGR888; // 目标格式：BGR888（OpenCV 可用）
-            cfg.target_width = hw_desc.width;        // 目标宽度
-            cfg.target_height = hw_desc.height;      // 目标高度
-            converter_ready = converter.initialize(cfg) && converter.isRgaActive();
-            converter_w = hw_desc.width;             // 缓存宽高
-            converter_h = hw_desc.height;
+        auto now = std::chrono::steady_clock::now();                                // 单调时钟（用于计算间隔）
+        auto timestamp = std::chrono::system_clock::now();                          // 系统时钟（对外时间戳）
+        const int64_t now_mono_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+        int64_t capture_mono_ns = now_mono_ns;
+        if (hw_desc.pts_us >= 0) {
+            const bool discontinuity = pts_anchor_us < 0 ||
+                (last_pts_us >= 0 &&
+                 (hw_desc.pts_us < last_pts_us || hw_desc.pts_us - last_pts_us > 1000000));
+            if (discontinuity) {
+                pts_anchor_us = hw_desc.pts_us;
+                mono_anchor_ns = now_mono_ns;
+            }
+            int64_t mapped_ns = mono_anchor_ns + (hw_desc.pts_us - pts_anchor_us) * 1000LL;
+            // WSL与板端单调时钟会有微小频差。超出可控窗口时立即重新锚定；
+            // 同批提前解出的下一帧则按PTS等待到应有时刻再发布，消除MPP突发而不丢帧。
+            if (mapped_ns > now_mono_ns + 60000000LL ||
+                now_mono_ns - mapped_ns > 80000000LL) {
+                pts_anchor_us = hw_desc.pts_us;
+                mono_anchor_ns = now_mono_ns;
+                mapped_ns = mono_anchor_ns;
+            } else if (mapped_ns > now_mono_ns) {
+                std::this_thread::sleep_until(std::chrono::steady_clock::time_point(
+                    std::chrono::nanoseconds(mapped_ns)));
+                now = std::chrono::steady_clock::now();
+                timestamp = std::chrono::system_clock::now();
+            }
+            capture_mono_ns = mapped_ns;
+            last_pts_us = hw_desc.pts_us;
         }
 
-        // ---- 执行 RGA 转换：NV12(DMA-BUF FD) → BGR888(cv::Mat) ----
-        cv::Mat frame;
-        if (!converter_ready || !converter.processFromFd(hw_desc.dma_fd, hw_desc.width,
-                hw_desc.height, hw_desc.width_stride, frame, hw_desc.height_stride,
-                hw_desc.buffer_size) || frame.empty()) {
-            // 转换失败（RGA 故障或参数无效），丢弃此帧
+        // ---- 发布原始NV12 DMA帧 ----
+        // 预览/拼接主链不再物化整帧BGR。frame_hold同时被FrameHub和可选推理任务
+        // 持有，最后一个消费者释放后MPP才可回收该解码缓冲。
+        FrameHub::DmaFrame dma_frame;
+        dma_frame.fd = hw_desc.dma_fd;
+        dma_frame.width = hw_desc.width;
+        dma_frame.height = hw_desc.height;
+        dma_frame.width_stride = hw_desc.width_stride;
+        dma_frame.height_stride = hw_desc.height_stride;
+        dma_frame.buffer_size = hw_desc.buffer_size;
+        dma_frame.format = hw_desc.format == MPP_FMT_YUV422SP
+            ? DmaPixelFormat::NV16 : DmaPixelFormat::NV12;
+        dma_frame.color_space = DmaColorSpace::Bt709Limited;
+        dma_frame.lease = hw_desc.frame_hold;
+        if (!dma_frame.valid()) {
             metrics_.frames_dropped.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -420,8 +418,8 @@ void VisibleRtspPipeline::processingLoop() {
         frame_rate_.tick();                // 帧率计数器滴答
         metrics_.tickFrame();              // 管线指标更新
         FrameHub::FrameOverlay overlay;
-        overlay.source_width = frame.cols;  // 源帧宽度
-        overlay.source_height = frame.rows; // 源帧高度
+        overlay.source_width = dma_frame.logicalWidth();
+        overlay.source_height = dma_frame.logicalHeight();
         overlay.frame_fps = frame_rate_.rate();       // 采集帧率
         overlay.inference_fps = inference_rate_.rate(); // 推理帧率
         overlay.frames_captured = metrics_.frames_in.load(std::memory_order_relaxed);      // 累计采集帧数
@@ -448,7 +446,7 @@ void VisibleRtspPipeline::processingLoop() {
         }
 
         // ---- 回调：将处理后的帧传给 FrameHub ----
-        if (frame_callback_) frame_callback_(frame, timestamp, capture_mono_ns, overlay);
+        if (frame_callback_) frame_callback_(dma_frame, timestamp, capture_mono_ns, overlay);
     }
 }
 
@@ -478,7 +476,7 @@ void VisibleRtspPipeline::inferenceLoop() {
             if (!running_.load() && !inference_pending_) break; // 停止且无待处理任务，退出
             if (!inference_pending_) continue;                   // 虚假唤醒，继续等待
             // 取出任务（移动语义，避免拷贝）
-            task = pending_inference_;
+            task = std::move(pending_inference_);
             pending_inference_ = {};
             inference_pending_ = false; // 清除待处理标志
         }
@@ -488,9 +486,18 @@ void VisibleRtspPipeline::inferenceLoop() {
         InferenceResult result;
         if (inference_service_ && task.desc.valid()) {
             // FD 直连推理：传入 DMA-BUF 文件描述符，零拷贝
-            result = inference_service_->inferFromFd({task.desc.dma_fd, task.desc.width,
-                task.desc.height, task.desc.width_stride, task.desc.height_stride,
-                task.desc.buffer_size, 0});
+            InferenceFrameDesc desc;
+            desc.dma_fd = task.desc.dma_fd;
+            desc.width = task.desc.width;
+            desc.height = task.desc.height;
+            desc.width_stride = task.desc.width_stride;
+            desc.height_stride = task.desc.height_stride;
+            desc.buffer_size = task.desc.buffer_size;
+            desc.pixel_format = task.desc.format == MPP_FMT_YUV422SP
+                ? RgaPixelFormat::NV16 : RgaPixelFormat::NV12;
+            desc.scheduler_slot = 0;
+            desc.frame_hold = std::move(task.desc.frame_hold);
+            result = inference_service_->inferFromFd(std::move(desc));
         }
         // 记录推理耗时（微秒）
         metrics_.last_inference_us.store(

@@ -23,15 +23,16 @@ ExecStartPre=/bin/sleep 10
 ExecStart=/userdata/rk3568_inspection_terminal/bin/rk3568_inspection_terminal
 # 仅在异常退出时重启（非零退出码或信号终止），正常退出不重启
 Restart=on-failure
-RestartSec=10                    # 重启间隔 10 秒，防止频繁震荡
-TimeoutStopSec=30                # 停止超时 30 秒，预留时间给录像保存和 MQTT 断开
-KillSignal=SIGTERM               # 先发送 SIGTERM（可被捕获用于优雅退出），超时后 SIGKILL
-LimitNOFILE=4096                 # 最大文件描述符数（RTSP/V4L2/SQLite 等需要较多 fd）
-LimitRTPRIO=99                   # 允许最高实时优先级 99（视频关键路径需要 RR 调度）
-LimitMEMLOCK=infinity            # 不限制内存锁定（mlockall 需要锁定全部内存页）
+# 以下值不要使用行尾注释，旧版 systemd 会把注释当作值的一部分。
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+LimitNOFILE=4096
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-# 默认不自动开机启动，避免开机卡死。需要可取消注释：
-# WantedBy=multi-user.target
+# 允许 systemctl enable；是否开机启动仍由部署者决定。
+WantedBy=multi-user.target

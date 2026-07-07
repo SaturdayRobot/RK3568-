@@ -31,6 +31,18 @@ enum class FrameSource {
     Count = 2          // 帧源总数，用于定义数组长度
 };
 
+enum class DmaPixelFormat : uint8_t {
+    NV12 = 0,
+    NV21 = 1,
+    NV16 = 2,
+};
+
+enum class DmaColorSpace : uint8_t {
+    Bt601Limited = 0,
+    Bt601Full = 1,
+    Bt709Limited = 2,
+};
+
 /**
  * @class FrameHub
  * @brief 多路帧数据交换中心（帧枢纽）
@@ -43,6 +55,27 @@ enum class FrameSource {
  */
 class FrameHub {
 public:
+    struct DmaFrame {
+        int fd = -1;
+        int width = 0;
+        int height = 0;
+        int width_stride = 0;
+        int height_stride = 0;
+        size_t buffer_size = 0;
+        int rotation = 0;  // 顺时针0/90/180/270；RGA合成时一次完成
+        DmaPixelFormat format = DmaPixelFormat::NV12;
+        DmaColorSpace color_space = DmaColorSpace::Bt709Limited;
+        std::shared_ptr<void> lease; // 持有期间采集端不得覆盖/回收DMA缓冲
+
+        bool valid() const {
+            return fd >= 0 && width > 0 && height > 0 &&
+                   width_stride >= width && height_stride >= height &&
+                   buffer_size > 0 && lease != nullptr;
+        }
+        int logicalWidth() const { return rotation == 90 || rotation == 270 ? height : width; }
+        int logicalHeight() const { return rotation == 90 || rotation == 270 ? width : height; }
+    };
+
     /**
      * @struct FrameOverlay
      * @brief 帧覆盖层元数据
@@ -72,6 +105,7 @@ public:
      */
     struct FrameSnapshot {
         std::shared_ptr<cv::Mat> frame;                          // 帧图像共享指针（避免拷贝）
+        DmaFrame dma;                                            // 首选DMA分发帧；frame为兼容回退
         std::chrono::system_clock::time_point timestamp{};       // 系统时钟时间戳
         int64_t capture_mono_ns = 0;                             // 采集时的 monotonic 时间戳（纳秒）
         uint64_t seq = 0;                                        // 帧序号（单调递增）
@@ -89,6 +123,7 @@ public:
         mutable std::mutex              mtx;           // 该槽位独立锁，保护本槽位所有字段
         mutable std::condition_variable cv;            // 新帧通知，消费者可 wait 等待
         std::shared_ptr<cv::Mat>        frame;         // 帧数据（shared_ptr 避免重复拷贝）
+        DmaFrame                        dma;           // DMA帧及采集缓冲生命周期令牌
         std::chrono::system_clock::time_point timestamp{}; // 帧时间戳（系统时钟）
         int64_t capture_mono_ns = 0;                   // 采集时 monotonic 时间戳（纳秒），用于同步计算
         uint64_t                        seq = 0;       // 帧序号（单调递增），消费者通过序号判断是否有新帧
@@ -112,6 +147,14 @@ public:
                 std::chrono::system_clock::time_point timestamp,
                 int64_t capture_mono_ns,
                 FrameOverlay overlay);
+
+    void updateDma(FrameSource source, DmaFrame frame,
+                   std::chrono::system_clock::time_point timestamp,
+                   int64_t capture_mono_ns,
+                   FrameOverlay overlay);
+
+    /// 释放槽位和同步队列持有的全部帧租约，停机时必须先于采集设备关闭调用。
+    void clear();
 
     /**
      * @brief 获取帧数据（非阻塞，shared_ptr 版本）

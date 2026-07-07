@@ -4,9 +4,7 @@
  *
  * 该文件定义了 RKNN NPU 推理后处理相关的数据结构和函数声明。
  *
- * 支持的模型类型：
- * - YOLOv5（3输出分支：8x/16x/32x 步长，anchor-based，NCHW INT8 输出）
- * - YOLOv8（NCHW 格式 DFL 边框回归，anchor-free，支持 score_sum 预过滤）
+ * 支持 YOLOv8 NCHW格式DFL边框回归（anchor-free，支持score_sum预过滤）。
  *
  * 核心数据结构：
  * - BOX_RECT：边界框坐标（左上角+右下角，像素坐标系）
@@ -90,8 +88,8 @@ typedef struct _detect_result_group_t
  * 允许外部动态配置标签文件路径，替代硬编码的默认路径。
  * 线程安全：内部使用 mutex 保护 g_label_path 的写操作。
  *
- * @note 必须在任何 post_process() 调用之前设置，否则使用默认路径 LABEL_NALE_TXT_PATH。
- * @deprecated 多模型场景请使用 post_process()/post_process_yolov8() 的 label_path 参数
+ * @note 必须在任何 post_process_yolov8() 调用之前设置，否则使用默认路径。
+ * @deprecated 多模型场景请使用 post_process_yolov8() 的 label_path 参数
  *             直接指定路径，该全局设置功能保留用于单模型简化场景。
  */
 void post_process_set_label_path(const std::string& path);
@@ -99,48 +97,12 @@ void post_process_set_label_path(const std::string& path);
 /**
  * @brief 强制重置标签缓存
  *
- * 清空内部标签缓存（g_label_cache），使下一个 post_process()/post_process_yolov8()
+ * 清空内部标签缓存（g_label_cache），使下一个 post_process_yolov8()
  * 调用重新从磁盘加载标签文件。适用于运行中切换模型的场景。
  *
  * 线程安全：内部使用 mutex 保护缓存的写操作。
  */
 void post_process_reset_labels();
-
-/**
- * @brief 目标检测后处理主函数（YOLOv5 风格，3输出分支，anchor-based）
- *
- * 处理模型三个步长输出层的 INT8 量化数据，执行反量化、边界框解码、
- * 置信度过滤、NMS 抑制，最终输出检测结果组。
- *
- * @param[in]  input0        第1个输出层数据指针（步长8，对应80x80特征图，检测小目标）
- * @param[in]  input1        第2个输出层数据指针（步长16，对应40x40特征图，检测中目标）
- * @param[in]  input2        第3个输出层数据指针（步长32，对应20x20特征图，检测大目标）
- * @param[in]  model_in_h    模型输入图像高度（像素）
- * @param[in]  model_in_w    模型输入图像宽度（像素）
- * @param[in]  conf_threshold 置信度阈值：只保留 obj_conf * class_conf >= threshold 的候选框
- * @param[in]  nms_threshold  NMS IoU 阈值：同一类别内 IoU > threshold 的低置信度框被抑制
- * @param[in]  scale_w       宽度缩放因子 = 原始图像宽度 / 模型输入宽度
- * @param[in]  scale_h       高度缩放因子 = 原始图像高度 / 模型输入高度
- * @param[in]  qnt_zps       量化零点数组（每个输出层一个 ZP 值），用于 INT8->FP32 反量化
- * @param[in]  qnt_scales    量化尺度数组（每个输出层一个 scale 值），用于 INT8->FP32 反量化
- * @param[out] group         检测结果组指针，存放 NMS 后的最终检测结果
- * @param[in]  class_num     模型可检测的类别总数（如 COCO=80）
- * @param[in]  label_path    标签文件路径（可选，空字符串使用全局默认路径）
- * @return 0=成功（无检测结果时也返回0），负值=失败
- *
- * 算法步骤（7步）：
- * 1. 加载标签文件（线程安全，按路径缓存，首次访问从磁盘读取）
- * 2. 对每个输出层调用 process() 解码边界框和置信度（INT8域预过滤 + FP32域精确计算）
- * 3. 按置信度降序排序（quick_sort_indice_inverse，O(n log n)）
- * 4. 提取所有唯一类别ID（std::set 自动去重）
- * 5. 对每个类别单独执行 per-class NMS
- * 6. 将模型坐标映射回原始图像坐标并填充 group
- */
-int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h, int model_in_w,
-                 float conf_threshold, float nms_threshold, float scale_w, float scale_h,
-                 std::vector<int32_t> &qnt_zps, std::vector<float> &qnt_scales,
-                 detect_result_group_t *group, int class_num,
-                 const std::string& label_path = "");
 
 /**
  * @brief 后处理反初始化函数
@@ -157,8 +119,7 @@ void deinitPostProcess(int class_num);
 /**
  * @brief Rockchip 优化的 YOLOv8 后处理函数（NCHW DFL 格式，anchor-free）
  *
- * 与标准 post_process() 的区别：
- * - 输入为 NCHW（通道-高度-宽度）格式，而非传统的 CHW 交错排列
+ * - 输入为 NCHW（通道-高度-宽度）INT8张量
  * - 使用 DFL（Distribution Focal Loss）回归边界框，而非 anchor-based 方法
  * - 每个分支输出 DFL box、class score、score sum 三个张量（共9个张量输出）
  * - 支持 letterbox 填充参数（pad_x/pad_y），正确处理非等比缩放场景
@@ -171,8 +132,8 @@ void deinitPostProcess(int class_num);
  * @param[in] model_in_w    模型输入宽度（像素）
  * @param[in] conf_threshold 置信度阈值
  * @param[in] nms_threshold  NMS IoU 阈值
- * @param[in] scale_w       宽度缩放因子 = 原始图像宽度 / (模型输入宽度 - 2*pad_x)
- * @param[in] scale_h       高度缩放因子 = 原始图像高度 / (模型输入高度 - 2*pad_y)
+ * @param[in] scale_w       letterbox 内容宽度 / 原始图像宽度
+ * @param[in] scale_h       letterbox 内容高度 / 原始图像高度
  * @param[in] pad_x         letterbox 左侧/右侧填充像素数
  * @param[in] pad_y         letterbox 顶部/底部填充像素数
  * @param[out] group        检测结果组（NMS 后的最终输出）

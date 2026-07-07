@@ -93,7 +93,7 @@ public:
     void stop();
 
     /// 解码帧回调函数类型：接收 BGR 帧、时间戳、monotonic 时间和覆盖层元数据
-    using DecodedFrameCallback = std::function<void(const cv::Mat&,
+    using DecodedFrameCallback = std::function<void(const FrameHub::DmaFrame&,
         std::chrono::system_clock::time_point, int64_t, const FrameHub::FrameOverlay&)>;
     /// 设置解码帧回调函数（处理后的 BGR 帧由此输出）
     void setFrameCallback(DecodedFrameCallback cb);

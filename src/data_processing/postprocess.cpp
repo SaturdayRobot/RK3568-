@@ -1,17 +1,8 @@
 /**
  * @file postprocess.cpp
- * @brief 目标检测后处理实现（YOLOv5 anchor-based 和 YOLOv8 DFL anchor-free）
+ * @brief YOLOv8 DFL anchor-free 目标检测后处理实现
  *
  * 该文件实现了基于 RKNN NPU 推理输出后处理所需的所有功能：
- *
- * --- YOLOv5 后处理流程 (post_process) ---
- * 1. INT8 量化模型输出 -> 反量化为 FP32
- * 2. 每个网格单元 x 3个锚点 -> 解码边界框坐标 (x, y, w, h)
- * 3. 计算 obj_confidence x class_confidence 作为最终置信度
- * 4. 置信度阈值过滤
- * 5. 按置信度降序排序
- * 6. 逐类别执行 NMS（非极大值抑制）
- * 7. 坐标映射回原始图像分辨率
  *
  * --- YOLOv8 后处理流程 (post_process_yolov8) ---
  * 1. 从 NCHW 格式张量中提取 DFL 边界框参数
@@ -22,7 +13,6 @@
  *
  * --- 量化与反量化 ---
  * 使用仿射量化（Affine Quantization）：
- *   quantize:   q = clip(f32 / scale + zp, -128, 127)
  *   dequantize: f32 = (q - zp) * scale
  *
  * --- NPU 推理的关键前提 ---
@@ -35,11 +25,9 @@
 #include <cmath>       // exp, fmax, fmin
 #include <cstdint>     // int8_t, int32_t
 #include <cstdio>      // printf
-#include <cstdlib>     // 标准库函数
-#include <cstring>     // strncpy, memset
+#include <cstring>     // strncpy
 
 #include <algorithm>   // std::max, std::sort
-#include <atomic>      // 原子操作（预留）
 #include <fstream>     // std::ifstream（读取标签文件）
 #include <mutex>       // std::mutex（线程安全保护标签缓存）
 #include <set>         // std::set（提取唯一类别ID）
@@ -56,17 +44,6 @@
 static std::unordered_map<std::string, std::vector<std::string>> g_label_cache;
 static std::mutex g_labels_mutex;
 static std::string g_label_path = LABEL_NALE_TXT_PATH;
-
-// === 锚点数组定义 ===
-// YOLOv5 使用 3 个输出分支，每个分支 3 个锚点（共 9 个锚点）
-// 锚点格式：[w0, h0, w1, h1, w2, h2]，单位为模型输入空间像素
-// 这些锚点值来源于训练数据集的 K-Means 聚类结果，针对 COCO 数据集优化
-// 步长 8 的锚点用于检测小目标（在 80x80 特征图上，感受野小）
-const int anchor0[6] = {10, 13, 16, 30, 33, 23};
-// 步长 16 的锚点用于检测中目标（在 40x40 特征图上，感受野中等）
-const int anchor1[6] = {30, 61, 62, 45, 59, 119};
-// 步长 32 的锚点用于检测大目标（在 20x20 特征图上，感受野大）
-const int anchor2[6] = {116, 90, 156, 198, 373, 326};
 
 /**
  * @brief 将浮点值限制在指定范围内
@@ -329,41 +306,6 @@ static int quick_sort_indice_inverse(std::vector<float> &input, int left, int ri
 }
 
 /**
- * @brief 将浮点值裁剪到 [min, max] 范围
- * @param val 输入值
- * @param min 最小值
- * @param max 最大值
- * @return 裁剪后的值（float->int32_t 截断）
- */
-inline static int32_t __clip(float val, float min, float max)
-{
-    float f = val <= min ? min : (val >= max ? max : val);
-    return f;  // 隐式 float->int32_t 截断
-}
-
-/**
- * @brief FP32 仿射量化为 INT8
- *
- * 公式：q = clip(round(f32 / scale + zp), -128, 127)
- *
- * 用于将浮点阈值转换为 INT8 量化值，使得置信度阈值比较可在 INT8 域直接进行，
- * 避免每个候选框都做反量化操作，显著提升后处理速度。
- *
- * @param f32   输入浮点值
- * @param zp    零点偏移（Zero Point），INT32 类型以支持非对称量化
- * @param scale 量化比例因子
- * @return 量化后的 INT8 值
- */
-static int8_t qnt_f32_to_affine(float f32, int32_t zp, float scale)
-{
-    // 应用量化公式：浮点值缩放到目标范围后再加零点
-    float dst_val = (f32 / scale) + zp;
-    // 裁剪到 INT8 有效范围 [-128, 127] 并转换为 int8_t
-    int8_t res = (int8_t)__clip(dst_val, -128, 127);
-    return res;
-}
-
-/**
  * @brief INT8 仿射反量化为 FP32
  *
  * 公式：f32 = (q - zp) * scale
@@ -380,281 +322,6 @@ static float deqnt_affine_to_f32(int8_t qnt, int32_t zp, float scale)
 {
     // 应用反量化公式：先减去零点，再乘以比例因子
     return ((float)qnt - (float)zp) * scale;
-}
-
-/**
- * @brief 处理单个输出层：解码边界框并过滤低置信度候选框
- *
- * YOLOv5 的每层输出为 NCHW 格式（通道-高度-宽度），
- * 每个网格单元输出 (5 + class_num) * 3 个值（3个锚点）。
- * 通道布局：[anchor0 {tx, ty, tw, th, obj, class0..classN}, anchor1{...}, anchor2{...}]
- *
- * 边界框解码公式（YOLOv5）：
- *   box_x = (sigmoid(tx) * 2 - 0.5 + grid_x) * stride
- *   box_y = (sigmoid(ty) * 2 - 0.5 + grid_y) * stride
- *   box_w = (sigmoid(tw) * 2)^2 * anchor_w
- *   box_h = (sigmoid(th) * 2)^2 * anchor_h
- *
- * 重要说明：YOLOv5 在 ONNX 导出时已将 sigmoid 融合到模型中
- * （pytorch 的 export 流程中，Detect 层的 forward 返回已过 sigmoid 的值）。
- * 因此代码中直接使用反量化后的值，无需再显式计算 sigmoid。
- *
- * @param[in]  input      INT8 量化模型输出数据（NCHW 格式，已展平为一维）
- * @param[in]  anchor     当前层的锚点数组（3对 w,h 值，单位：模型输入空间像素）
- * @param[in]  grid_h     特征图高度（网格行数）
- * @param[in]  grid_w     特征图宽度（网格列数）
- * @param[in]  height     模型输入高度
- * @param[in]  width      模型输入宽度
- * @param[in]  stride     当前层的步长（下采样倍率，= model_h / grid_h）
- * @param[out] boxes      边界框坐标输出（逐个追加 x, y, w, h）
- * @param[out] objProbs   目标置信度输出（obj_conf * class_conf）
- * @param[out] classId    类别ID输出
- * @param[in]  threshold  置信度阈值（浮点值，将为INT8比较而量化）
- * @param[in]  zp         量化零点偏移
- * @param[in]  scale      量化比例因子
- * @param[in]  class_num  类别总数
- * @return 本层输出的有效候选框数量
- */
-static int process(int8_t *input, int *anchor, int grid_h, int grid_w, int height, int width,
-                   int stride, std::vector<float> &boxes, std::vector<float> &objProbs,
-                   std::vector<int> &classId, float threshold, int32_t zp, float scale,
-                   int class_num)
-{
-    int validCount = 0;               // 有效检测框累计计数
-    int grid_len = grid_h * grid_w;   // 网格单元总数（空间维度展平后的长度）
-
-    // 将浮点阈值转换为 INT8 量化值，避免每个候选框都做反量化比较
-    // 这是一个关键的性能优化：在 INT8 域做阈值比较，仅在通过后才反量化计算精确坐标
-    int8_t thres_i8 = qnt_f32_to_affine(threshold, zp, scale);
-
-    // 遍历 3 个锚点（每个网格预测 3 个边界框，对应不同的宽高比）
-    for (int a = 0; a < 3; a++)
-    {
-        // 遍历每个网格行
-        for (int i = 0; i < grid_h; i++)
-        {
-            // 遍历每个网格列
-            for (int j = 0; j < grid_w; j++)
-            {
-                // 计算目标置信度（obj_conf）在 NCHW 数据中的位置
-                // NCHW 布局：通道维度上依次排列 3 组，每组 (5 + class_num) 个通道
-                // obj_conf 是每组中索引为 4 的通道（前4个是 tx, ty, tw, th）
-                int8_t box_confidence = input[((5 + class_num) * a + 4) * grid_len + i * grid_w + j];
-
-                // 快速过滤：目标置信度低于阈值直接跳过（INT8 域比较，无需反量化）
-                if (box_confidence >= thres_i8)
-                {
-                    // 计算当前锚点和网格单元在展平数据中的起始偏移
-                    // offset 指向 tx（当前锚点、当前网格的边界框参数起始位置）
-                    int offset = ((5 + class_num) * a) * grid_len + i * grid_w + j;
-                    int8_t *in_ptr = input + offset;  // 定位到当前预测的起始地址
-
-                    // --- YOLOv5 边界框解码 ---
-                    // 注意：tx, ty, tw, th 在 NCHW 中按通道维度连续排列，间隔为 grid_len
-                    // tx: in_ptr[0], ty: in_ptr[grid_len], tw: in_ptr[2*grid_len], th: in_ptr[3*grid_len]
-
-                    // tx, ty：预测的边界框中心偏移（模型输出已过 sigmoid，无需再计算）
-                    // 公式：box_center = sigmoid(pred) * 2 - 0.5
-                    // YOLOv5 解码策略：将中心点限制在当前网格附近（[-0.5, 1.5] 范围），避免偏移过大
-                    float box_x = (deqnt_affine_to_f32(*in_ptr, zp, scale)) * 2.0 - 0.5;
-                    float box_y = (deqnt_affine_to_f32(in_ptr[grid_len], zp, scale)) * 2.0 - 0.5;
-
-                    // tw, th：预测的宽高缩放因子（模型输出已过 sigmoid，无需再计算）
-                    // 公式：box_size = (sigmoid(pred) * 2)^2 * anchor_size
-                    float box_w = (deqnt_affine_to_f32(in_ptr[2 * grid_len], zp, scale)) * 2.0;
-                    float box_h = (deqnt_affine_to_f32(in_ptr[3 * grid_len], zp, scale)) * 2.0;
-
-                    // 从网格坐标转换为图像坐标（模型输入空间）
-                    // 中心点坐标 = (相对偏移 + 网格索引) * 步长
-                    box_x = (box_x + j) * (float)stride;
-                    box_y = (box_y + i) * (float)stride;
-                    // 宽高 = 缩放因子^2 * 锚点尺寸
-                    box_w = box_w * box_w * (float)anchor[a * 2];      // a*2 = 锚点宽度索引
-                    box_h = box_h * box_h * (float)anchor[a * 2 + 1];  // a*2+1 = 锚点高度索引
-
-                    // 将中心坐标转换为左上角坐标（统一使用 (x, y, w, h) 格式）
-                    box_x -= (box_w / 2.0);
-                    box_y -= (box_h / 2.0);
-
-                    // 在当前预测的 class_num 个类别分数中找出最大值及对应类别
-                    int8_t maxClassProbs = in_ptr[5 * grid_len];  // 第一个类别分数（class_0，在通道5）
-                    int maxClassId = 0;
-                    for (int k = 1; k < class_num; ++k)
-                    {
-                        int8_t prob = in_ptr[(5 + k) * grid_len];  // 第 k 个类别分数
-                        if (prob > maxClassProbs)
-                        {
-                            maxClassId = k;
-                            maxClassProbs = prob;
-                        }
-                    }
-
-                    // 类别置信度阈值过滤（INT8 域比较）
-                    if (maxClassProbs > thres_i8)
-                    {
-                        // 计算最终置信度 = (反量化后的)类别置信度 * (反量化后的)目标置信度
-                        // 这里必须反量化为 FP32，因为在阈值比较后需要精确的置信度值供后续 NMS 排序使用
-                        objProbs.push_back((deqnt_affine_to_f32(maxClassProbs, zp, scale)) *
-                                           (deqnt_affine_to_f32(box_confidence, zp, scale)));
-                        classId.push_back(maxClassId);  // 保存类别ID
-                        validCount++;                    // 有效框计数+1
-                        // 添加边界框坐标：左上角 x, y, 宽度 w, 高度 h
-                        boxes.push_back(box_x);
-                        boxes.push_back(box_y);
-                        boxes.push_back(box_w);
-                        boxes.push_back(box_h);
-                    }
-                }
-            }
-        }
-    }
-    return validCount;  // 返回本层有效候选框总数
-}
-
-/**
- * @brief 目标检测后处理主函数（YOLOv5 风格，anchor-based，3输出分支）
- *
- * 完整后处理管道：
- *
- *   INT8输入(x3层) -> process()解码+过滤 -> 合并所有候选框
- *     -> 按置信度降序排序 -> 逐类别NMS -> 坐标映射 -> 填充group
- *
- * 坐标映射说明：
- * - 模型输入经 letterbox resize 后可能不等于原始图像尺寸
- * - scale_w = 原始图像宽度 / 模型输入宽度（即映射比例因子）
- * - scale_h = 原始图像高度 / 模型输入高度
- * - 模型坐标 / scale = 原始图像坐标（注意：letterbox 场景需额外处理 pad）
- *
- * @return 0=成功（即使无检测结果也返回0），负值=失败
- */
-int post_process(int8_t *input0, int8_t *input1, int8_t *input2, int model_in_h, int model_in_w,
-                 float conf_threshold, float nms_threshold, float scale_w, float scale_h,
-                 std::vector<int32_t> &qnt_zps, std::vector<float> &qnt_scales,
-                 detect_result_group_t *group, int class_num, const std::string& label_path)
-{
-    // 加载标签（线程安全，按路径缓存）
-    std::vector<std::string> labels = loadLabelsOnce(class_num, label_path);
-
-    // === 中间结果容器 ===
-    std::vector<float> filterBoxes;   // 所有候选框的坐标（每框4个float：x, y, w, h）
-    filterBoxes.reserve(1024);        // 预分配减少热路径 vector 扩容开销
-    std::vector<float> objProbs;      // 所有候选框的最终置信度（obj_conf * class_conf）
-    objProbs.reserve(256);
-    std::vector<int> classId;         // 所有候选框的类别ID
-    classId.reserve(256);
-
-    // === 处理步长 8 的输出层（80x80 特征图，检测小目标）===
-    // 步长越小，特征图分辨率越高，负责检测越小的目标
-    int stride0 = 8;                                            // 步长：8倍下采样（相对于输入）
-    int grid_h0 = model_in_h / stride0;                         // 特征图高度 = 模型高度/步长
-    int grid_w0 = model_in_w / stride0;                         // 特征图宽度 = 模型宽度/步长
-    int validCount0 = 0;
-    validCount0 = process(input0, (int *)anchor0, grid_h0, grid_w0, model_in_h, model_in_w,
-                          stride0, filterBoxes, objProbs, classId,
-                          conf_threshold, qnt_zps[0], qnt_scales[0], class_num);
-
-    // === 处理步长 16 的输出层（40x40 特征图，检测中目标）===
-    int stride1 = 16;
-    int grid_h1 = model_in_h / stride1;
-    int grid_w1 = model_in_w / stride1;
-    int validCount1 = 0;
-    validCount1 = process(input1, (int *)anchor1, grid_h1, grid_w1, model_in_h, model_in_w,
-                          stride1, filterBoxes, objProbs, classId,
-                          conf_threshold, qnt_zps[1], qnt_scales[1], class_num);
-
-    // === 处理步长 32 的输出层（20x20 特征图，检测大目标）===
-    int stride2 = 32;
-    int grid_h2 = model_in_h / stride2;
-    int grid_w2 = model_in_w / stride2;
-    int validCount2 = 0;
-    validCount2 = process(input2, (int *)anchor2, grid_h2, grid_w2, model_in_h, model_in_w,
-                          stride2, filterBoxes, objProbs, classId,
-                          conf_threshold, qnt_zps[2], qnt_scales[2], class_num);
-
-    // 汇总三层有效框总数
-    int validCount = validCount0 + validCount1 + validCount2;
-
-    // 无目标检测：直接返回成功（空结果也是合法的输出）
-    if (validCount <= 0)
-    {
-        return 0;
-    }
-
-    // === 创建索引数组用于排序 ===
-    std::vector<int> indexArray(validCount);
-    for (int i = 0; i < validCount; ++i)
-    {
-        indexArray[i] = i;  // 初始化索引为 0, 1, 2, ...
-    }
-
-    // === 按置信度降序排序 ===
-    // quick_sort_indice_inverse: 对 objProbs 降序排列，同步更新 indexArray
-    // 排序后的 indexArray[0] 指向置信度最高的框，indexArray[-1] 指向最低的框
-    quick_sort_indice_inverse(objProbs, 0, validCount - 1, indexArray);
-
-    // === 提取所有唯一的类别ID ===
-    // 使用 std::set 自动去重和排序，用于后续逐类别 NMS
-    std::set<int> class_set(std::begin(classId), std::end(classId));
-
-    // === 逐类别执行 NMS ===
-    // 关键设计选择：使用 per-class NMS 而非 class-agnostic NMS
-    // 原因：不同类别的目标即使高度重叠（如"人"骑"自行车"），也不应互相抑制。
-    // 如果使用 class-agnostic NMS，骑自行车的人可能被错误地抑制掉。
-    for (auto c : class_set)
-    {
-        nms(validCount, filterBoxes, classId, indexArray, c, nms_threshold);
-    }
-
-    // === 构建最终检测结果组 ===
-    int last_count = 0;   // 最终有效结果计数（NMS 后保留的框数）
-    group->count = 0;     // 初始化结果数量
-
-    for (int i = 0; i < validCount; ++i)
-    {
-        // 跳过已被 NMS 抑制的框（order[j] = -1），以及达到最大数量上限
-        if (indexArray[i] == -1 || last_count >= OBJ_NUMB_MAX_SIZE)
-        {
-            continue;
-        }
-
-        int n = indexArray[i];  // 获取排序后的原始索引（指向原始框数据）
-
-        // 提取边界框坐标
-        float x1 = filterBoxes[n * 4 + 0];      // 左上角 x（模型输入空间）
-        float y1 = filterBoxes[n * 4 + 1];      // 左上角 y（模型输入空间）
-        float x2 = x1 + filterBoxes[n * 4 + 2]; // 右下角 x = x + w
-        float y2 = y1 + filterBoxes[n * 4 + 3]; // 右下角 y = y + h
-
-        int id = classId[n];           // 类别ID
-        float obj_conf = objProbs[i];  // 置信度（排序后可能不等于原始顺序的值，但近似）
-
-        // 坐标映射：模型输入空间 -> 原始图像空间
-        // 1. clamp: 裁剪到模型输入范围内（防止越界坐标）
-        // 2. /scale: 将模型坐标缩放到原始图像分辨率
-        //    scale_w = orig_width / model_width, 所以 model_coord / scale_w = orig_coord
-        group->results[last_count].box.left   = (int)(clamp(x1, 0, model_in_w) / scale_w);
-        group->results[last_count].box.top    = (int)(clamp(y1, 0, model_in_h) / scale_h);
-        group->results[last_count].box.right  = (int)(clamp(x2, 0, model_in_w) / scale_w);
-        group->results[last_count].box.bottom = (int)(clamp(y2, 0, model_in_h) / scale_h);
-
-        group->results[last_count].class_id = id;
-
-        // 设置类别名称：优先使用标签文件中的名称，回退到 "class_N" 格式
-        const std::string fallback_name = "class_" + std::to_string(id);
-        const std::string& result_name =
-            (id >= 0 && static_cast<size_t>(id) < labels.size()) ? labels[id] : fallback_name;
-        // strncpy：安全字符串拷贝，保证不超过缓冲区大小（OBJ_NAME_MAX_SIZE）
-        strncpy(group->results[last_count].name, result_name.c_str(), OBJ_NAME_MAX_SIZE - 1);
-        group->results[last_count].name[OBJ_NAME_MAX_SIZE - 1] = '\0';  // 强制终止符
-
-        group->results[last_count].prop = obj_conf;  // 置信度
-
-        last_count++;  // 有效结果计数+1
-    }
-
-    group->count = last_count;  // 设置最终检测结果总数
-
-    return 0;
 }
 
 /**
@@ -768,7 +435,10 @@ int post_process_yolov8(const std::vector<void*>& outputs,
                         const std::string& label_path) {
     // 参数有效性校验：output_count 必须 >= 6（至少2张量×3分支）且为3的倍数
     if (!attrs || !group || output_count < 6 || output_count % 3 != 0 ||
-        static_cast<int>(outputs.size()) < output_count || class_num <= 0) return -1;
+        static_cast<int>(outputs.size()) < output_count || class_num <= 0 ||
+        model_in_h <= 0 || model_in_w <= 0 || scale_w <= 0.0F || scale_h <= 0.0F ||
+        pad_x < 0.0F || pad_y < 0.0F || pad_x * 2.0F >= model_in_w ||
+        pad_y * 2.0F >= model_in_h) return -1;
 
     // 加载标签
     std::vector<std::string> labels = loadLabelsOnce(class_num, label_path);
@@ -780,6 +450,7 @@ int post_process_yolov8(const std::vector<void*>& outputs,
 
     // YOLOv8 输出分为 branches=3 个分支（对应3个下采样步长）
     const int outputs_per_branch = output_count / 3;  // 每个分支的张量数量（2或3）
+    if (outputs_per_branch != 2 && outputs_per_branch != 3) return -1;
 
     for (int branch = 0; branch < 3; ++branch)
     {
@@ -791,7 +462,10 @@ int post_process_yolov8(const std::vector<void*>& outputs,
         const auto& box_attr = attrs[box_index];      // 边框张量属性（含维度、量化参数）
         const auto& score_attr = attrs[score_index];  // 分数张量属性
         // 检查数据有效性和维度（NCHW 至少需要4维）
-        if (!outputs[box_index] || !outputs[score_index] || box_attr.n_dims < 4) return -1;
+        if (!outputs[box_index] || !outputs[score_index] ||
+            box_attr.type != RKNN_TENSOR_INT8 || score_attr.type != RKNN_TENSOR_INT8 ||
+            box_attr.fmt != RKNN_TENSOR_NCHW || score_attr.fmt != RKNN_TENSOR_NCHW ||
+            box_attr.n_dims != 4 || score_attr.n_dims != 4) return -1;
 
         // 解析张量维度（NCHW 格式：N=1, C=channels, H=height, W=width）
         const int grid_h = static_cast<int>(box_attr.dims[2]);  // H 维度：特征图高度
@@ -799,14 +473,25 @@ int post_process_yolov8(const std::vector<void*>& outputs,
         const int box_channels = static_cast<int>(box_attr.dims[1]); // C 维度：边框通道数 = dfl_len * 4
         const int dfl_len = box_channels / 4;  // 每条边的 DFL bin 数量（标准 YOLOv8 为 16）
 
-        if (grid_h <= 0 || grid_w <= 0 || dfl_len <= 0) return -1;
+        if (grid_h <= 0 || grid_w <= 0 || box_channels <= 0 || box_channels % 4 != 0 ||
+            dfl_len <= 0 || static_cast<int>(score_attr.dims[1]) < class_num ||
+            score_attr.dims[2] != box_attr.dims[2] ||
+            score_attr.dims[3] != box_attr.dims[3]) return -1;
 
-        const int stride = model_in_h / grid_h;  // 当前分支的下采样步长（=8, 16, 32）
+        const float stride_x = static_cast<float>(model_in_w) / grid_w;
+        const float stride_y = static_cast<float>(model_in_h) / grid_h;
 
         // 获取各张量的数据指针
         const auto* box_data = static_cast<const int8_t*>(outputs[box_index]);    // 边框回归
         const auto* score_data = static_cast<const int8_t*>(outputs[score_index]); // 类别分数
         const auto* sum_data = sum_index >= 0 ? static_cast<const int8_t*>(outputs[sum_index]) : nullptr;
+        if (sum_index >= 0) {
+            const auto& sum_attr = attrs[sum_index];
+            if (!sum_data || sum_attr.type != RKNN_TENSOR_INT8 ||
+                sum_attr.fmt != RKNN_TENSOR_NCHW || sum_attr.n_dims != 4 ||
+                sum_attr.dims[1] != 1 || sum_attr.dims[2] != box_attr.dims[2] ||
+                sum_attr.dims[3] != box_attr.dims[3]) return -1;
+        }
 
         const int grid_stride = grid_h * grid_w;  // 空间维度的总元素数（用于 NCHW 索引计算）
 
@@ -858,10 +543,10 @@ int post_process_yolov8(const std::vector<void*>& outputs,
                 //   y1 = (grid_y + 0.5 - top)    * stride
                 //   x2 = (grid_x + 0.5 + right)  * stride
                 //   y2 = (grid_y + 0.5 + bottom) * stride
-                const float x1 = (x + 0.5F - distance[0]) * stride;
-                const float y1 = (y + 0.5F - distance[1]) * stride;
-                const float x2 = (x + 0.5F + distance[2]) * stride;
-                const float y2 = (y + 0.5F + distance[3]) * stride;
+                const float x1 = (x + 0.5F - distance[0]) * stride_x;
+                const float y1 = (y + 0.5F - distance[1]) * stride_y;
+                const float x2 = (x + 0.5F + distance[2]) * stride_x;
+                const float y2 = (y + 0.5F + distance[3]) * stride_y;
 
                 // 存储为 (x, y, w, h) 格式（与标准 NMS 函数接口兼容）
                 boxes.insert(boxes.end(), {x1, y1, x2 - x1, y2 - y1});
@@ -871,7 +556,7 @@ int post_process_yolov8(const std::vector<void*>& outputs,
         }
     }
 
-    // === 排序与 NMS（与 YOLOv5 后处理共享相同逻辑）===
+    // === 排序与逐类别 NMS ===
     const int valid_count = static_cast<int>(probabilities.size());
     group->count = 0;
     if (valid_count == 0) return 0;  // 无候选框，直接返回
@@ -886,7 +571,7 @@ int post_process_yolov8(const std::vector<void*>& outputs,
     // 提取所有唯一类别ID
     std::set<int> class_set(classes.begin(), classes.end());
 
-    // 逐类别执行 NMS（per-class NMS，理由同 YOLOv5）
+    // 逐类别执行 NMS，避免不同类别的重叠目标互相抑制
     for (const int class_id : class_set)
     {
         nms(valid_count, boxes, classes, order, class_id, nms_threshold);

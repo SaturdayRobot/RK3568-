@@ -13,7 +13,9 @@
 // C++ 标准库
 // =============================================================================
 #include <atomic>      // std::atomic<bool> — 无锁线程间停止信号
+#include <algorithm>
 #include <chrono>      // system_clock / steady_clock / duration_cast — 时间戳与超时
+#include <cstdlib>
 #include <csignal>     // std::signal — 注册 SIGINT/SIGTERM/SIGPIPE 处理函数
 #include <cstring>     // std::strerror — errno 可读化
 #include <sstream>     // std::ostringstream — 高效拼接 JSON 统计字符串
@@ -40,6 +42,7 @@
 // 项目内部头文件
 // =============================================================================
 #include "app/app_initializer.h"   // AppInitializer::initialize() / shutdown()
+#include "config/ini_config.h"
 
 namespace { // 匿名命名空间 — 以下符号仅当前翻译单元可见
 
@@ -60,16 +63,22 @@ void handleSignal(int) {
 // 硬件看门狗管理 — /dev/watchdog 需要在超时前周期性写入，否则系统会被硬件复位
 // -----------------------------------------------------------------------------
 
+void closeWatchdog();
+
 /** 打开看门狗设备并设置超时时间 */
-bool openWatchdog(const char* device = "/dev/watchdog") {
+bool openWatchdog(const char* device, int requested_timeout) {
     g_watchdog_fd = ::open(device, O_WRONLY);
     if (g_watchdog_fd < 0) {
         std::cerr << "[Watchdog] cannot open " << device << ": "
                   << std::strerror(errno) << std::endl;
         return false;
     }
-    int timeout = 30; // 30 秒超时 — 与 systemd WatchdogSec 保持一致
-    ::ioctl(g_watchdog_fd, WDIOC_SETTIMEOUT, &timeout);
+    int timeout = std::max(5, requested_timeout);
+    if (::ioctl(g_watchdog_fd, WDIOC_SETTIMEOUT, &timeout) < 0) {
+        std::cerr << "[Watchdog] cannot set timeout: " << std::strerror(errno) << std::endl;
+        closeWatchdog();
+        return false;
+    }
     std::cout << "[Watchdog] opened " << device << " timeout=" << timeout << "s" << std::endl;
     return true;
 }
@@ -152,9 +161,20 @@ int main(int argc, char* argv[]) {
         return 1; // 初始化失败，返回非零退出码
     }
 
-    // ---- 阶段 2：启动硬件看门狗 ----
-    // 失败不中止程序 — 看门狗是可选的（某些部署环境没有 /dev/watchdog）
-    openWatchdog();
+    // ---- 阶段 2：按配置启动硬件看门狗 ----
+    // 调试/试运行阶段默认关闭。否则应用崩溃会在几十秒后被放大成整机复位，
+    // 丢失现场日志；量产确认稳定后再显式启用。
+    const char* config_env = std::getenv("EDGE_SENSOR_CONFIG");
+    const std::string config_path = config_env ? config_env : "../config/sensors.ini";
+    IniConfig runtime_config;
+    if (runtime_config.load(config_path) &&
+        runtime_config.getBool("watchdog", "enable", false)) {
+        const std::string device = runtime_config.getString(
+            "watchdog", "device", "/dev/watchdog");
+        openWatchdog(device.c_str(), runtime_config.getInt("watchdog", "timeout_sec", 30));
+    } else {
+        std::cout << "[Watchdog] disabled by configuration" << std::endl;
+    }
 
     // ---- 阶段 3：通知 systemd 服务就绪 ----
     // Type=notify 模式要求服务主动上报 READY，否则 systemd 认为服务未启动

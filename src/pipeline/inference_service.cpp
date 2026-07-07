@@ -21,7 +21,8 @@
  *
  * 零拷贝推理路径（inferFromFd）：
  * - 从 MPP 硬件解码器获取 DMA-BUF FD
- * - 直接在 NPU 侧导入 FD，无需 CPU 拷贝 NV12 数据
+ * - RGA 从解码 FD 读取 NV12，直接写入 RKNN 绑定的 RGB DMA-BUF
+ * - NPU 从绑定输入 DMA-BUF 读取，不经过中间 cv::Mat/rknn_inputs_set
  * - RGA 预处理由 RKNN 模型内部完成
  */
 #include "pipeline/inference_service.h"
@@ -55,7 +56,8 @@ InferenceService::~InferenceService() { shutdown(); } // 析构时自动关闭
 // 6. 输出路由配置
 // ============================================================================
 bool InferenceService::initialize(const InferenceServiceConfig& config) {
-    if (initialized_) return true; // 已初始化，幂等返回
+    std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+    if (initialized_.load(std::memory_order_acquire)) return true; // 已初始化，幂等返回
     config_ = config;
     bool any_loaded = false; // 是否至少加载了一个模型
 
@@ -104,8 +106,8 @@ bool InferenceService::initialize(const InferenceServiceConfig& config) {
                   << std::dec << " models_per_frame=" << config_.source_models_per_frame[source] << '\n';
     }
 
-    initialized_ = any_loaded; // 至少一个模型可用才算初始化成功
-    return initialized_;
+    initialized_.store(any_loaded, std::memory_order_release); // 至少一个模型可用才算初始化成功
+    return initialized_.load(std::memory_order_acquire);
 }
 
 // ============================================================================
@@ -114,8 +116,14 @@ bool InferenceService::initialize(const InferenceServiceConfig& config) {
 // 加锁保护 model 数组的释放操作，防止与正在执行的推理产生竞态。
 // ============================================================================
 void InferenceService::shutdown() {
-    initialized_ = false; // 首先标记未初始化，阻止新的推理提交
-    std::lock_guard<std::mutex> lock(npu_mutex_); // NPU 互斥锁：保护模型释放
+    std::unique_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+    initialized_.store(false, std::memory_order_release); // 首先阻止新的推理提交
+    std::array<std::unique_lock<std::mutex>, kMaxInferenceModels> model_locks{
+        std::unique_lock<std::mutex>(model_mutex_[0]),
+        std::unique_lock<std::mutex>(model_mutex_[1]),
+        std::unique_lock<std::mutex>(model_mutex_[2]),
+        std::unique_lock<std::mutex>(model_mutex_[3])};
+    std::lock_guard<std::mutex> lock(npu_mutex_); // 锁顺序固定为 model -> NPU
     for (auto& model : models_) model.reset();    // 逐一释放所有模型
 }
 
@@ -143,10 +151,10 @@ InferenceResult InferenceService::infer(const cv::Mat& frame, int scheduler_slot
 // @param desc 帧描述符（包含 DMA-BUF FD、尺寸、stride 等）
 // @return     推理结果
 //
-// 委托给 inferImpl() 统一执行。FD 直连推理避免了 NV12 → BGR 的 CPU 拷贝，
-// NPU 侧直接从 DMA-BUF 读取数据。
+// 委托给 inferImpl() 统一执行。RGA 将 NV12 FD 直接转换到 RKNN 输入 DMA-BUF，
+// NPU 从绑定缓冲读取 RGB tensor，不经过中间 cv::Mat。
 // ============================================================================
-InferenceResult InferenceService::inferFromFd(const InferenceFrameDesc& desc) {
+InferenceResult InferenceService::inferFromFd(InferenceFrameDesc desc) {
     if (!desc.valid()) {
         // 无效描述符：返回跳过状态
         InferenceResult result;
@@ -174,12 +182,13 @@ InferenceResult InferenceService::inferFromFd(const InferenceFrameDesc& desc) {
 // 7. 性能统计：记录耗时、次数、最大值等
 // ============================================================================
 InferenceResult InferenceService::inferImpl(const cv::Mat* frame,
-                                            const InferenceFrameDesc* desc,
+                                            InferenceFrameDesc* desc,
                                             int scheduler_slot) {
     InferenceResult result;
+    std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
 
     // ---- 1. 前置检查 ----
-    if (!initialized_) {
+    if (!initialized_.load(std::memory_order_acquire)) {
         result.skipped = true;
         result.skip_reason = "service_not_ready"; // 服务未就绪
         return result;
@@ -201,11 +210,14 @@ InferenceResult InferenceService::inferImpl(const cv::Mat* frame,
     // 收集路由掩码中启用的模型的索引列表
     std::vector<size_t> active;
     for (size_t i = 0; i < models_.size(); ++i) {
-        if (models_[i] && (route_mask & (1u << i))) active.push_back(i); // 模型已加载且在掩码中
+        if (models_[i] && (route_mask & (1u << i)) &&
+            (!desc || models_[i]->supportsFdInput())) {
+            active.push_back(i);
+        }
     }
     if (active.empty()) {
         result.skipped = true;
-        result.skip_reason = "no_model_for_source"; // 此源没有配置任何模型
+        result.skip_reason = desc ? "no_fd_model_for_source" : "no_model_for_source";
         return result;
     }
 
@@ -216,43 +228,13 @@ InferenceResult InferenceService::inferImpl(const cv::Mat* frame,
     // 原子递增轮转计数并计算起始索引
     const size_t start = source_round_robin_[source].fetch_add(run_count) % active.size();
 
-    // ---- 4. 逐个模型推理 ----
-    cv::Mat shared_preproc;  // 同帧首个模型 RGA 预处理后共享给后续模型（避免重复 RGA 操作）
+    std::vector<size_t> selected;
+    selected.reserve(run_count);
     for (size_t offset = 0; offset < run_count; ++offset) {
-        // 轮转选取模型（从 start 开始，循环取 run_count 个）
-        const size_t index = active[(start + offset) % active.size()];
+        selected.push_back(active[(start + offset) % active.size()]);
+    }
 
-        // 加锁保护单个模型的 RKNN 上下文（不支持多线程并发使用同一个上下文）
-        std::lock_guard<std::mutex> model_lock(model_mutex_[index]);
-
-        const auto started = std::chrono::steady_clock::now(); // 推理开始计时
-        bool ok = false;
-
-        if (desc) {
-            // ---- FD 直连推理路径（零拷贝） ----
-            // 传入 DMA-BUF FD，NPU 直接从硬件缓冲区读取 NV12 数据
-            ok = models_[index]->interfFromFd(result.detections[index], desc->dma_fd,
-                desc->width, desc->height, desc->width_stride, desc->height_stride,
-                desc->buffer_size, false, &npu_mutex_) == 0;
-        } else {
-            // ---- cv::Mat 推理路径 ----
-            // 如果有共享预处理缓冲区（同帧前一个模型已完成 RGA 预处理），设置给当前模型
-            if (!shared_preproc.empty()) {
-                models_[index]->setSharedPreproc(shared_preproc);
-            }
-            // 设置原始图像（模型内部会执行 RGA 预处理）
-            models_[index]->ori_img = *frame;
-            // 执行推理
-            ok = models_[index]->interf(result.detections[index], false, &npu_mutex_) == 0;
-            // 如果成功且尚未缓存预处理结果，保存以供后续模型复用
-            if (shared_preproc.empty() && ok) {
-                shared_preproc = models_[index]->getPreprocessedBuf(); // 获取预处理缓冲区
-            }
-        }
-
-        // ---- 推理性能统计 ----
-        const int64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - started).count();     // 本次推理耗时（微秒）
+    auto finish_model = [&](size_t index, bool ok, int64_t elapsed) {
         model_count_[index].fetch_add(1);                            // 累计推理次数
         model_total_us_[index].fetch_add(static_cast<uint64_t>(elapsed)); // 累计总耗时
         model_last_us_[index].store(elapsed);                        // 最近一次耗时
@@ -261,7 +243,7 @@ InferenceResult InferenceService::inferImpl(const cv::Mat* frame,
         while (elapsed > current_max &&
                !model_max_us_[index].compare_exchange_weak(current_max, elapsed)) {}
 
-        if (!ok) continue; // 推理失败，跳过此模型
+        if (!ok) return;
 
         // ---- 5. 类别过滤（按流类型过滤） ----
         // 根据 source 的 stream_class_filter 白名单过滤检测结果
@@ -283,6 +265,66 @@ InferenceResult InferenceService::inferImpl(const cv::Mat* frame,
         // 标记该模型有更新
         result.updated_mask |= static_cast<uint8_t>(1u << index); // 设置位掩码
         result.success = true; // 至少一个模型成功
+    };
+
+    if (desc) {
+        // Acquire all per-model locks in stable index order. Holding them across the
+        // prepare/run split prevents another source from overwriting a prepared input.
+        std::vector<size_t> lock_order = selected;
+        std::sort(lock_order.begin(), lock_order.end());
+        std::vector<std::unique_lock<std::mutex>> model_locks;
+        model_locks.reserve(lock_order.size());
+        for (size_t index : lock_order) model_locks.emplace_back(model_mutex_[index]);
+
+        std::array<bool, kMaxInferenceModels> prepared{};
+        std::array<int64_t, kMaxInferenceModels> elapsed_us{};
+        for (size_t index : selected) {
+            const auto started = std::chrono::steady_clock::now();
+            prepared[index] = models_[index]->prepareFromFd(
+                desc->dma_fd, desc->width, desc->height,
+                desc->width_stride, desc->height_stride, desc->buffer_size,
+                desc->pixel_format) == 0;
+            elapsed_us[index] += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - started).count();
+        }
+
+        // Every synchronous RGA submission has returned. No selected model accesses
+        // the decoder buffer beyond this point, so MPP may recycle it while NPU runs.
+        desc->frame_hold.reset();
+
+        for (size_t index : selected) {
+            bool ok = false;
+            if (prepared[index]) {
+                const auto started = std::chrono::steady_clock::now();
+                ok = models_[index]->inferPrepared(
+                    result.detections[index], &npu_mutex_) == 0;
+                elapsed_us[index] += std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+            }
+            finish_model(index, ok, elapsed_us[index]);
+            const auto lock_it = std::lower_bound(lock_order.begin(), lock_order.end(), index);
+            if (lock_it != lock_order.end() && *lock_it == index) {
+                model_locks[static_cast<size_t>(lock_it - lock_order.begin())].unlock();
+            }
+        }
+        return result;
+    }
+
+    // cv::Mat path retains shared preprocessing and locks one model at a time.
+    cv::Mat shared_preproc;
+    for (size_t index : selected) {
+        std::lock_guard<std::mutex> model_lock(model_mutex_[index]);
+        const auto started = std::chrono::steady_clock::now();
+        if (!shared_preproc.empty()) models_[index]->setSharedPreproc(shared_preproc);
+        models_[index]->ori_img = *frame;
+        const bool ok = models_[index]->interf(
+            result.detections[index], false, &npu_mutex_) == 0;
+        if (shared_preproc.empty() && ok) {
+            shared_preproc = models_[index]->getPreprocessedBuf();
+        }
+        const int64_t elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        finish_model(index, ok, elapsed);
     }
     return result;
 }
@@ -294,7 +336,13 @@ InferenceResult InferenceService::inferImpl(const cv::Mat* frame,
 // 运行时动态调整 NPU 核心分配策略。
 // ============================================================================
 void InferenceService::setCoreMask(rknn_core_mask mask) {
-    std::lock_guard<std::mutex> lock(npu_mutex_); // NPU 全局锁
+    std::shared_lock<std::shared_mutex> lifecycle_lock(lifecycle_mutex_);
+    std::array<std::unique_lock<std::mutex>, kMaxInferenceModels> model_locks{
+        std::unique_lock<std::mutex>(model_mutex_[0]),
+        std::unique_lock<std::mutex>(model_mutex_[1]),
+        std::unique_lock<std::mutex>(model_mutex_[2]),
+        std::unique_lock<std::mutex>(model_mutex_[3])};
+    std::lock_guard<std::mutex> lock(npu_mutex_); // 与推理保持一致的锁顺序，避免死锁
     for (auto& model : models_) if (model) model->setCoreMask(mask); // 逐一设置
 }
 

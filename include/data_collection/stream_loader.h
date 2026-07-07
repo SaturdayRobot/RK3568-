@@ -59,12 +59,6 @@ extern "C"
  * @param id 解码器实例ID
  * @param frame_hold_token 帧生命周期令牌（持有期间MPP不回收该DMA缓冲区）
  */
-typedef std::function<void(void *userdata, int width_stride, int height_stride,
-                           int width, int height, int format, int fd, void *data,
-                           size_t buffer_size, int id,
-                           const std::shared_ptr<void>& frame_hold_token)>
-    MppDecoderFrameCallback;
-
 /**
  * @class StreamLoader
  * @brief 视频流加载器类
@@ -100,11 +94,13 @@ public:
         int height = 0;                    // 有效高度（像素）
         int width_stride = 0;              // 宽度步长（含对齐填充）
         int height_stride = 0;             // 高度步长（含对齐填充）
+        int format = MPP_FMT_YUV420SP;     // MPP_FMT_YUV420SP(NV12) / YUV422SP(NV16)
         size_t buffer_size = 0;            // DMA缓冲区总大小（字节）
+        int64_t pts_us = -1;               // 输入码流PTS（微秒），用于消除异步解码回调抖动
         std::shared_ptr<void> frame_hold;  // 帧生命周期令牌
 
         bool valid() const {
-            return dma_fd > 0 && width > 0 && height > 0;
+            return dma_fd >= 0 && width > 0 && height > 0;
         }
     };
 

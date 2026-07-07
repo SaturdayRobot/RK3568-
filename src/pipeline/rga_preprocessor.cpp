@@ -119,6 +119,7 @@ int toRgaFormat(RgaPixelFormat fmt) {
         case RgaPixelFormat::RGB888:   return RK_FORMAT_RGB_888;       // RGB 8-8-8 三通道
         case RgaPixelFormat::NV12:     return RK_FORMAT_YCbCr_420_SP;  // YUV 4:2:0 半平面（Y + UV 交错）
         case RgaPixelFormat::NV21:     return RK_FORMAT_YCrCb_420_SP;  // YUV 4:2:0 半平面（Y + VU 交错）
+        case RgaPixelFormat::NV16:     return RK_FORMAT_YCbCr_422_SP;  // YUV 4:2:2 半平面（Y + UV 交错）
         case RgaPixelFormat::RGBA8888: return RK_FORMAT_RGBA_8888;     // RGBA 8-8-8-8 四通道
         case RgaPixelFormat::BGRA8888: return RK_FORMAT_BGRA_8888;     // BGRA 8-8-8-8 四通道
         default:                       return RK_FORMAT_BGR_888;       // 默认回退 BGR888
@@ -308,6 +309,25 @@ bool RgaPreprocessor::processFromFd(int src_fd, int src_width, int src_height,
 
     std::cerr << "[RgaPreprocessor] processFromFd: RGA not available or invalid fd" << std::endl;
     return false;
+}
+
+bool RgaPreprocessor::processFdToFdLetterbox(
+        int src_fd, int src_width, int src_height,
+        int src_stride, int src_height_stride, size_t src_buffer_size,
+        RgaPixelFormat src_format,
+        int dst_fd, int dst_width, int dst_height,
+        int dst_stride, int dst_height_stride, size_t dst_buffer_size,
+        int resized_width, int resized_height, int offset_x, int offset_y,
+        bool clear_padding,
+        uint8_t padding_value) {
+    if (!initialized_ || !rga_available_ || src_fd < 0 || dst_fd < 0) {
+        return false;
+    }
+    return processRgaFdToFdLetterbox(
+        src_fd, src_width, src_height, src_stride, src_height_stride, src_buffer_size,
+        src_format,
+        dst_fd, dst_width, dst_height, dst_stride, dst_height_stride, dst_buffer_size,
+        resized_width, resized_height, offset_x, offset_y, clear_padding, padding_value);
 }
 
 // ============================================================================
@@ -726,6 +746,269 @@ bool RgaPreprocessor::processRgaFd(int src_fd, int src_width, int src_height,
     if (status != IM_STATUS_SUCCESS) {
         reportRgaResult(false);
         std::cerr << "[RgaPreprocessor] imresize (fd) failed: " << imStrError(status) << std::endl;
+        return false;
+    }
+    reportRgaResult(true);
+    return true;
+}
+
+bool RgaPreprocessor::processRgaFdToFdLetterbox(
+        int src_fd, int src_width, int src_height,
+        int src_stride, int src_height_stride, size_t src_buffer_size,
+        RgaPixelFormat src_format,
+        int dst_fd, int dst_width, int dst_height,
+        int dst_stride, int dst_height_stride, size_t dst_buffer_size,
+        int resized_width, int resized_height, int offset_x, int offset_y,
+        bool clear_padding,
+        uint8_t padding_value) {
+    if (!rgaRuntimeHealthy()) return false;
+    if ((src_format != RgaPixelFormat::NV12 && src_format != RgaPixelFormat::NV16) ||
+        config_.dst_format != RgaPixelFormat::RGB888 ||
+        dst_width != config_.target_width || dst_height != config_.target_height ||
+        src_width <= 0 || src_height <= 0 || dst_width <= 0 || dst_height <= 0 ||
+        resized_width <= 0 || resized_height <= 0 || offset_x < 0 || offset_y < 0 ||
+        offset_x + resized_width > dst_width || offset_y + resized_height > dst_height) {
+        return false;
+    }
+
+    const int source_wstride = src_stride > 0 ? src_stride : src_width;
+    const int source_hstride = src_height_stride > 0 ? src_height_stride : src_height;
+    const int target_wstride = dst_stride > 0 ? dst_stride : dst_width;
+    const int target_hstride = dst_height_stride > 0 ? dst_height_stride : dst_height;
+    if (source_wstride < src_width || source_hstride < src_height ||
+        target_wstride < dst_width || target_hstride < dst_height ||
+        (src_width & 1) != 0 || (src_height & 1) != 0 ||
+        (source_wstride & 1) != 0 || (source_hstride & 1) != 0 ||
+        source_wstride > 8192 || source_hstride > 8192 ||
+        target_wstride > 8192 || target_hstride > 8192) {
+        return false;
+    }
+
+    const int64_t minimum_source_size = static_cast<int64_t>(source_wstride) *
+        source_hstride * (src_format == RgaPixelFormat::NV16 ? 2 : 3) /
+        (src_format == RgaPixelFormat::NV16 ? 1 : 2);
+    const int64_t source_size = src_buffer_size > 0
+        ? static_cast<int64_t>(src_buffer_size) : minimum_source_size;
+    const int64_t minimum_target_size = static_cast<int64_t>(target_wstride) *
+                                        target_hstride * 3;
+    const int64_t target_size = dst_buffer_size > 0
+        ? static_cast<int64_t>(dst_buffer_size) : minimum_target_size;
+    if (source_size < minimum_source_size || target_size < minimum_target_size ||
+        source_size > std::numeric_limits<int>::max() ||
+        target_size > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    RgaSubmissionGuard rga_guard;
+    if (!rgaRuntimeHealthy()) return false;
+
+    rga_buffer_handle_t src_handle = importbuffer_fd(src_fd, static_cast<int>(source_size));
+    if (src_handle == 0) {
+        std::cerr << "[RgaPreprocessor] import source DMA-BUF failed" << std::endl;
+        return false;
+    }
+    rga_buffer_handle_t dst_handle = importbuffer_fd(dst_fd, static_cast<int>(target_size));
+    if (dst_handle == 0) {
+        releasebuffer_handle(src_handle);
+        std::cerr << "[RgaPreprocessor] import RKNN input DMA-BUF failed" << std::endl;
+        return false;
+    }
+
+    rga_buffer_t rga_src = wrapbuffer_handle(
+        src_handle, src_width, src_height,
+        src_format == RgaPixelFormat::NV16
+            ? RK_FORMAT_YCbCr_422_SP : RK_FORMAT_YCbCr_420_SP,
+        source_wstride, source_hstride);
+    rga_buffer_t rga_dst = wrapbuffer_handle(
+        dst_handle, dst_width, dst_height, RK_FORMAT_RGB_888,
+        target_wstride, target_hstride);
+    rga_src.color_space_mode = toRgaFullColorSpace(config_.color_space);
+    rga_dst.color_space_mode = IM_RGB_FULL;
+
+    const im_rect full_target{0, 0, dst_width, dst_height};
+    const int padding_color = (static_cast<int>(padding_value) << 16) |
+                              (static_cast<int>(padding_value) << 8) |
+                              static_cast<int>(padding_value);
+    IM_STATUS status = clear_padding
+        ? imfill(rga_dst, full_target, padding_color, 1)
+        : IM_STATUS_SUCCESS;
+    if (status == IM_STATUS_SUCCESS) {
+        const im_rect source_rect{0, 0, src_width, src_height};
+        const im_rect target_rect{offset_x, offset_y, resized_width, resized_height};
+        status = imcheck(rga_src, rga_dst, source_rect, target_rect);
+        if (status == IM_STATUS_NOERROR) {
+            // IM_SYNC guarantees that the source DMA-BUF can be released on return.
+            status = improcess(
+                rga_src, rga_dst, {}, source_rect, target_rect, {}, IM_SYNC);
+        }
+    }
+
+    releasebuffer_handle(dst_handle);
+    releasebuffer_handle(src_handle);
+
+    if (status != IM_STATUS_SUCCESS) {
+        // This operation may be unsupported by a particular RGA/BSP combination.
+        // Do not trip the global RGA circuit breaker and take down display/encode.
+        std::cerr << "[RgaPreprocessor] FD-to-RKNN letterbox failed: "
+                  << imStrError(status) << std::endl;
+        return false;
+    }
+    reportRgaResult(true);
+    return true;
+}
+
+bool RgaPreprocessor::composeDmaToFdNv12(
+        const std::vector<RgaDmaComposeTask>& tasks,
+        int dst_fd, int dst_width, int dst_height,
+        int dst_stride, int dst_height_stride, size_t dst_buffer_size) {
+    if (!initialized_ || !rga_available_ || !rgaRuntimeHealthy() || tasks.empty() ||
+        dst_fd < 0 || dst_width <= 0 || dst_height <= 0) return false;
+
+    const int target_wstride = dst_stride > 0 ? dst_stride : dst_width;
+    const int target_hstride = dst_height_stride > 0 ? dst_height_stride : dst_height;
+    const int64_t minimum_target_size = static_cast<int64_t>(target_wstride) *
+                                        target_hstride * 3 / 2;
+    const int64_t target_size = dst_buffer_size > 0
+        ? static_cast<int64_t>(dst_buffer_size) : minimum_target_size;
+    if (target_wstride < dst_width || target_hstride < dst_height ||
+        (target_wstride & 1) || (target_hstride & 1) ||
+        target_size < minimum_target_size || target_size > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    RgaSubmissionGuard rga_guard;
+    if (!rgaRuntimeHealthy()) return false;
+
+    rga_buffer_handle_t dst_handle = importbuffer_fd(dst_fd, static_cast<int>(target_size));
+    if (dst_handle == 0) return false;
+    rga_buffer_t rga_dst = wrapbuffer_handle(
+        dst_handle, dst_width, dst_height, RK_FORMAT_YCbCr_420_SP,
+        target_wstride, target_hstride);
+    rga_dst.color_space_mode = IM_YUV_BT709_LIMIT_RANGE;
+
+    // 每帧先清空整张目标画布。否则某一路掉线或 contain/cover ROI 改变后，
+    // MPP 复用缓冲中会残留上一帧，表现为冻结画面、脏边，甚至误判为源仍在线。
+    const im_rect full_target{0, 0, dst_width, dst_height};
+    const IM_STATUS clear_status = imfill(rga_dst, full_target, 0x000000, 1);
+    if (clear_status != IM_STATUS_SUCCESS) {
+        releasebuffer_handle(dst_handle);
+        return false;
+    }
+
+    std::vector<rga_buffer_handle_t> source_handles;
+    source_handles.reserve(tasks.size());
+    std::vector<rga_buffer_t> source_buffers;
+    std::vector<im_rect> source_rects;
+    std::vector<im_rect> target_rects;
+    std::vector<int> usages;
+    source_buffers.reserve(tasks.size());
+    source_rects.reserve(tasks.size());
+    target_rects.reserve(tasks.size());
+    usages.reserve(tasks.size());
+    auto release_handles = [&]() {
+        for (auto handle : source_handles) {
+            if (handle != 0) releasebuffer_handle(handle);
+        }
+        releasebuffer_handle(dst_handle);
+    };
+
+    im_job_handle_t job = imbeginJob(0);
+    if (job == 0) {
+        release_handles();
+        return false;
+    }
+
+    bool inputs_ok = true;
+    bool task_api_ok = true;
+    for (const auto& task : tasks) {
+        const int source_wstride = task.src_width_stride > 0
+            ? task.src_width_stride : task.src_width;
+        const int source_hstride = task.src_height_stride > 0
+            ? task.src_height_stride : task.src_height;
+        const int64_t minimum_source_size = static_cast<int64_t>(source_wstride) *
+            source_hstride * (task.src_format == RgaPixelFormat::NV16 ? 2 : 3) /
+            (task.src_format == RgaPixelFormat::NV16 ? 1 : 2);
+        const int64_t source_size = task.src_buffer_size > 0
+            ? static_cast<int64_t>(task.src_buffer_size) : minimum_source_size;
+        const cv::Rect source_bounds(0, 0, task.src_width, task.src_height);
+        const cv::Rect target_bounds(0, 0, dst_width, dst_height);
+        if (task.src_fd < 0 || !task.lease || task.src_width <= 0 || task.src_height <= 0 ||
+            source_wstride < task.src_width || source_hstride < task.src_height ||
+            source_size < minimum_source_size || source_size > std::numeric_limits<int>::max() ||
+            task.source_rect.area() <= 0 || (task.source_rect & source_bounds) != task.source_rect ||
+            task.destination_rect.area() <= 0 ||
+            (task.destination_rect & target_bounds) != task.destination_rect ||
+            (task.destination_rect.x & 1) || (task.destination_rect.y & 1) ||
+            (task.destination_rect.width & 1) || (task.destination_rect.height & 1)) {
+            inputs_ok = false;
+            break;
+        }
+
+        const int source_format = task.src_format == RgaPixelFormat::NV21
+            ? RK_FORMAT_YCrCb_420_SP
+            : task.src_format == RgaPixelFormat::NV16
+                ? RK_FORMAT_YCbCr_422_SP : RK_FORMAT_YCbCr_420_SP;
+        rga_buffer_handle_t src_handle = importbuffer_fd(
+            task.src_fd, static_cast<int>(source_size));
+        if (src_handle == 0) {
+            inputs_ok = false;
+            break;
+        }
+        source_handles.push_back(src_handle);
+        rga_buffer_t rga_src = wrapbuffer_handle(
+            src_handle, task.src_width, task.src_height, source_format,
+            source_wstride, source_hstride);
+        rga_src.color_space_mode = toRgaFullColorSpace(task.color_space);
+
+        int usage = IM_SYNC;
+        if (task.rotation == 90) usage |= IM_HAL_TRANSFORM_ROT_90;
+        else if (task.rotation == 180) usage |= IM_HAL_TRANSFORM_ROT_180;
+        else if (task.rotation == 270) usage |= IM_HAL_TRANSFORM_ROT_270;
+        else if (task.rotation != 0) {
+            inputs_ok = false;
+            break;
+        }
+        const im_rect source_rect{task.source_rect.x, task.source_rect.y,
+                                  task.source_rect.width, task.source_rect.height};
+        const im_rect target_rect{task.destination_rect.x, task.destination_rect.y,
+                                  task.destination_rect.width, task.destination_rect.height};
+        source_buffers.push_back(rga_src);
+        source_rects.push_back(source_rect);
+        target_rects.push_back(target_rect);
+        usages.push_back(usage);
+        if (task_api_ok && improcessTask(
+                job, rga_src, rga_dst, {}, source_rect, target_rect, {},
+                nullptr, usage) != IM_STATUS_SUCCESS) {
+            task_api_ok = false;
+        }
+    }
+
+    IM_STATUS status = IM_STATUS_FAILED;
+    if (inputs_ok && task_api_ok) status = imendJob(job, IM_SYNC, 0, nullptr);
+    else imcancelJob(job);
+
+    // 老BSP可能提供task API头文件但驱动不接受多任务job。逐路同步提交仍然
+    // 直接写同一MPP DMA输入，不退回BGR，也不会影响源缓冲释放时机。
+    if (inputs_ok && status != IM_STATUS_SUCCESS &&
+        source_buffers.size() == tasks.size()) {
+        status = IM_STATUS_SUCCESS;
+        for (size_t i = 0; i < source_buffers.size(); ++i) {
+            const IM_STATUS one = improcess(
+                source_buffers[i], rga_dst, {}, source_rects[i], target_rects[i], {}, usages[i]);
+            if (one != IM_STATUS_SUCCESS) {
+                status = one;
+                break;
+            }
+        }
+    }
+    release_handles();
+    if (!inputs_ok || status != IM_STATUS_SUCCESS) {
+        static std::atomic<uint64_t> failure_count{0};
+        const uint64_t count = failure_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count == 1 || count % 100 == 0) {
+            std::cerr << "[RgaPreprocessor] direct DMA mosaic failed: "
+                      << imStrError(status) << " count=" << count << std::endl;
+        }
         return false;
     }
     reportRgaResult(true);

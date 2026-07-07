@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <poll.h>
+#include <utility>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -34,6 +35,49 @@ int xioctl(int fd, unsigned long request, void* arg) {
 }  // namespace
 
 namespace pipeline {
+
+struct V4l2BufferRequeueState {
+    std::mutex mutex;
+    int fd = -1;
+    uint32_t buffer_type = 0;
+    uint32_t num_planes = 1;
+    std::vector<size_t> lengths;
+    bool active = false;
+
+    bool queue(uint32_t index) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!active || fd < 0 || index >= lengths.size()) return false;
+        v4l2_buffer buffer{};
+        buffer.type = static_cast<v4l2_buf_type>(buffer_type);
+        buffer.memory = V4L2_MEMORY_MMAP;
+        buffer.index = index;
+        v4l2_plane planes[VIDEO_MAX_PLANES]{};
+        if (buffer_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            planes[0].length = static_cast<uint32_t>(lengths[index]);
+            buffer.m.planes = planes;
+            buffer.length = num_planes;
+        }
+        return xioctl(fd, VIDIOC_QBUF, &buffer) == 0;
+    }
+
+    void deactivate() {
+        std::lock_guard<std::mutex> lock(mutex);
+        active = false;
+        fd = -1;
+    }
+};
+
+namespace {
+struct V4l2BufferLease {
+    std::shared_ptr<V4l2BufferRequeueState> state;
+    uint32_t index = 0;
+    V4l2BufferLease(std::shared_ptr<V4l2BufferRequeueState> value, uint32_t buffer_index)
+        : state(std::move(value)), index(buffer_index) {}
+    V4l2BufferLease(const V4l2BufferLease&) = delete;
+    V4l2BufferLease& operator=(const V4l2BufferLease&) = delete;
+    ~V4l2BufferLease() { if (state) state->queue(index); }
+};
+}  // namespace
 
 // 构造函数：保存配置并初始化各成员变量为默认值
 V4l2CameraPipeline::V4l2CameraPipeline(V4l2CameraConfig config) : config_(std::move(config)) {}
@@ -156,11 +200,10 @@ bool V4l2CameraPipeline::openDevice() {
             height_stride_ = static_cast<int>(candidate);  // 采用反推出的对齐高度
         }
     }
-    // 第8步：校验最终协商后的格式是否在支持列表中（仅支持单平面 NV12/NV21/YUYV/UYVY）
+    // DMA直达拼接主链只接受单平面NV12/NV21。打包YUV422无法安全伪装成NV12，
+    // 必须在启动阶段失败，避免运行后出现花屏或RGA越界。
     if (num_planes_ != 1 ||
-        (fourcc_ != V4L2_PIX_FMT_NV12 && fourcc_ != V4L2_PIX_FMT_NV21 &&
-         fourcc_ != V4L2_PIX_FMT_YUYV &&
-         fourcc_ != V4L2_PIX_FMT_UYVY)) {
+        (fourcc_ != V4L2_PIX_FMT_NV12 && fourcc_ != V4L2_PIX_FMT_NV21)) {
         std::cerr << "[IMX415] unsupported negotiated format or plane count: fourcc=0x"
                   << std::hex << fourcc_ << std::dec << " planes=" << num_planes_ << '\n';
         closeDevice(); return false;
@@ -217,6 +260,13 @@ bool V4l2CameraPipeline::openDevice() {
     } else {
         rga_config.color_space = RgaColorSpace::Bt709Limited;              // 默认 BT.709 限制范围
     }
+    if (rga_config.color_space == RgaColorSpace::Bt601Full) {
+        dma_color_space_ = DmaColorSpace::Bt601Full;
+    } else if (rga_config.color_space == RgaColorSpace::Bt601Limited) {
+        dma_color_space_ = DmaColorSpace::Bt601Limited;
+    } else {
+        dma_color_space_ = DmaColorSpace::Bt709Limited;
+    }
     std::cout << "[IMX415] colorspace=" << negotiated_colorspace
               << " ycbcr=" << negotiated_ycbcr
               << " quantization=" << negotiated_quantization
@@ -230,15 +280,23 @@ bool V4l2CameraPipeline::openDevice() {
 
     // 第11步：申请 MMAP 缓冲区（VIDIOC_REQBUFS），用于内核-用户空间零拷贝
     v4l2_requestbuffers request{};
-    request.count = 4;                   // 申请 4 个缓冲区（典型的乒乓缓冲+余量）
+    // 同步队列、最新帧槽位、编码队列和推理预处理会同时短暂持有DMA租约。
+    // 8个缓冲只剩1个可供ISP采集，实测会把30fps压到约25fps；请求12个保留余量。
+    request.count = 12;
     request.type = static_cast<v4l2_buf_type>(buffer_type_);
     request.memory = V4L2_MEMORY_MMAP;   // 使用内存映射方式
-    if (xioctl(fd_, VIDIOC_REQBUFS, &request) < 0 || request.count < 2) {
-        std::cerr << "[IMX415] MMAP buffer request failed\n";
+    if (xioctl(fd_, VIDIOC_REQBUFS, &request) < 0 || request.count < 4) {
+        std::cerr << "[IMX415] DMA distribution requires at least 4 capture buffers\n";
         closeDevice(); return false;
     }
     // 第12步：逐个查询、映射、导出、入队每个缓冲区
     buffers_.resize(request.count);
+    requeue_state_ = std::make_shared<V4l2BufferRequeueState>();
+    requeue_state_->fd = fd_;
+    requeue_state_->buffer_type = buffer_type_;
+    requeue_state_->num_planes = num_planes_;
+    requeue_state_->lengths.resize(request.count);
+    requeue_state_->active = true;
     for (uint32_t i = 0; i < request.count; ++i) {
         v4l2_buffer buffer{};
         buffer.type = request.type; buffer.memory = request.memory; buffer.index = i;
@@ -251,6 +309,7 @@ bool V4l2CameraPipeline::openDevice() {
         if (xioctl(fd_, VIDIOC_QUERYBUF, &buffer) < 0) { closeDevice(); return false; }
         buffers_[i].length = buffer_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
             ? planes[0].length : buffer.length;  // 缓冲区实际长度
+        requeue_state_->lengths[i] = buffers_[i].length;
         const off_t offset = buffer_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
             ? static_cast<off_t>(planes[0].m.mem_offset) : static_cast<off_t>(buffer.m.offset);
         // mmap 将内核缓冲区映射到用户空间，实现零拷贝访问
@@ -274,6 +333,11 @@ bool V4l2CameraPipeline::openDevice() {
         buffers_.begin(), buffers_.end(), [](const Buffer& buffer) { return buffer.dma_fd >= 0; }));
     std::cout << "[IMX415] exported DMA-BUF buffers=" << exported << '/' << buffers_.size()
               << " rga_zero_cpu_copy=" << (camera_rga_ready_ && exported == buffers_.size()) << '\n';
+    if (exported != buffers_.size()) {
+        std::cerr << "[IMX415] DMA distribution requires every V4L2 buffer to export a valid fd\n";
+        closeDevice();
+        return false;
+    }
 
     // 第13步：开启视频流（VIDIOC_STREAMON），驱动开始填充缓冲区
     v4l2_buf_type type = static_cast<v4l2_buf_type>(buffer_type_);
@@ -284,6 +348,7 @@ bool V4l2CameraPipeline::openDevice() {
 
 // closeDevice(): 关闭设备并释放所有资源（与 openDevice 的流程反向）
 void V4l2CameraPipeline::closeDevice() {
+    if (requeue_state_) requeue_state_->deactivate();
     // 如果设备已开启流，先停止流（VIDIOC_STREAMOFF）
     if (fd_ >= 0 && online_.exchange(false)) {
         v4l2_buf_type type = static_cast<v4l2_buf_type>(buffer_type_);
@@ -298,6 +363,7 @@ void V4l2CameraPipeline::closeDevice() {
     // 关闭 V4L2 设备文件描述符
     if (fd_ >= 0) ::close(fd_);
     fd_ = -1;
+    requeue_state_.reset();
 }
 
 // queueBuffer(): 将指定索引的缓冲区重新加入 V4L2 驱动采集队列（VIDIOC_QBUF）
@@ -305,18 +371,7 @@ void V4l2CameraPipeline::closeDevice() {
 // - 返回值: true 表示入队成功
 // - 采集线程拿到一帧数据后，处理线程处理完毕需要将该缓冲区重新入队，形成循环
 bool V4l2CameraPipeline::queueBuffer(uint32_t index) {
-    if (fd_ < 0 || index >= buffers_.size()) return false;
-    v4l2_buffer buffer{};
-    buffer.type = static_cast<v4l2_buf_type>(buffer_type_);
-    buffer.memory = V4L2_MEMORY_MMAP;
-    buffer.index = index;
-    v4l2_plane planes[VIDEO_MAX_PLANES]{};
-    if (buffer_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
-        planes[0].length = static_cast<uint32_t>(buffers_[index].length); // 设置平面数据长度
-        buffer.m.planes = planes;
-        buffer.length = num_planes_;
-    }
-    return xioctl(fd_, VIDIOC_QBUF, &buffer) == 0;  // 调用 VIDIOC_QBUF 入队
+    return requeue_state_ && requeue_state_->queue(index);
 }
 
 // start(): 启动摄像头管线，包括打开设备、启动采集/处理/推理三个线程
@@ -485,21 +540,10 @@ void V4l2CameraPipeline::processingLoop() {
         const auto& capture_buffer = buffers_[static_cast<size_t>(buffer_index)];
 
         const auto now = std::chrono::steady_clock::now();
-        bool converted = false;
-        // 优先尝试 RGA 硬件 DMA-BUF 零拷贝路径（从 DMA fd 直接转换到 cv::Mat）
-        if (!converted && camera_rga_ready_ && capture_buffer.dma_fd >= 0) {
-            converted = camera_rga_.processFromFd(capture_buffer.dma_fd, config_.width,
-                config_.height, stride_, frame, height_stride_, capture_buffer.length);
-        }
-        // 回退到 CPU 路径：从 MMAP 地址读取原始数据，由 OpenCV 完成颜色转换
-        if (!converted) {
-            converted = convertFrame(capture_buffer.address, bytes_used, frame);
-        }
-        // 转换失败，将缓冲区重新入队并跳过本帧处理
-        if (!converted) {
-            queueBuffer(static_cast<uint32_t>(buffer_index));
-            continue;
-        }
+        const bool should_infer = inference_service_ &&
+            (last_inference_submit.time_since_epoch().count() == 0 ||
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 now - last_inference_submit).count() >= config_.inference_interval_ms);
 
         // 获取缓存的检测结果（来自推理线程），用于叠加到画面上
         std::array<detect_result_group_t, kMaxInferenceModels> detections{};
@@ -523,45 +567,46 @@ void V4l2CameraPipeline::processingLoop() {
             }
         }
 
-        // 图像旋转处理：优先使用 RGA 硬件旋转，回退到 OpenCV 旋转
-        if (config_.rotation != 0) {
-            cv::Mat rotated;
-            if (!camera_rga_.rotateBgr(frame, rotated, config_.rotation)) { // RGA 旋转失败
-                if (config_.rotation == 90) {
-                    cv::rotate(frame, rotated, cv::ROTATE_90_CLOCKWISE);         // 顺时针 90 度
-                } else if (config_.rotation == 180) {
-                    cv::rotate(frame, rotated, cv::ROTATE_180);                  // 180 度
-                } else {
-                    cv::rotate(frame, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);  // 逆时针 90 度（270 度）
+        // 预览主链直接发布DMA；只有达到推理采样间隔时才物化一次BGR并旋转。
+        if (should_infer) {
+            bool converted = camera_rga_ready_ && capture_buffer.dma_fd >= 0 &&
+                camera_rga_.processFromFd(capture_buffer.dma_fd, config_.width,
+                    config_.height, stride_, frame, height_stride_, capture_buffer.length);
+            if (!converted) converted = convertFrame(capture_buffer.address, bytes_used, frame);
+            if (converted && config_.rotation != 0) {
+                cv::Mat rotated;
+                if (!camera_rga_.rotateBgr(frame, rotated, config_.rotation)) {
+                    if (config_.rotation == 90) {
+                        cv::rotate(frame, rotated, cv::ROTATE_90_CLOCKWISE);
+                    } else if (config_.rotation == 180) {
+                        cv::rotate(frame, rotated, cv::ROTATE_180);
+                    } else {
+                        cv::rotate(frame, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);
+                    }
                 }
+                frame = std::move(rotated);
             }
-            frame = std::move(rotated);  // 替换为旋转后的图像
-        }
-
-        // 推理始终消费最终朝向的画面，检测框天然与显示坐标一致；避免每帧再做
-        // 一轮框坐标旋转，也不会因中间分辨率变化产生偏移。
-        // 定期提交帧到推理线程（按 inference_interval_ms 间隔，避免推理拥塞处理管线）
-        if (inference_service_ &&
-            (last_inference_submit.time_since_epoch().count() == 0 ||            // 首次提交
-             std::chrono::duration_cast<std::chrono::milliseconds>(
-                 now - last_inference_submit).count() >= config_.inference_interval_ms)) {
-            {
+            if (converted && !frame.empty()) {
                 std::lock_guard<std::mutex> lock(inference_mutex_);
                 inference_frame_ = frame;                // 复制帧数据到推理缓冲区
                 inference_timestamp_ = timestamp;         // 传递时间戳
                 inference_mono_ns_ = capture_mono_ns;     // 传递采集纳秒
                 inference_pending_ = true;                // 设置推理待处理标志
+                inference_cv_.notify_one();
+                last_inference_submit = now;
             }
-            inference_cv_.notify_one();                  // 唤醒推理线程
-            last_inference_submit = now;                 // 更新上次提交时间
         }
 
         // 更新帧率统计（处理帧率）
         frame_rate_.tick();
         // 构建叠加层信息，包含检测框、帧率统计等元数据
         FrameHub::FrameOverlay overlay;
-        overlay.source_width = frame.cols;               // 源图像宽度（旋转后）
-        overlay.source_height = frame.rows;              // 源图像高度（旋转后）
+        const int inference_width = std::min(config_.width, config_.processing_width);
+        const int inference_height = std::min(config_.height, config_.processing_height);
+        overlay.source_width = config_.rotation == 90 || config_.rotation == 270
+            ? inference_height : inference_width;
+        overlay.source_height = config_.rotation == 90 || config_.rotation == 270
+            ? inference_width : inference_height;
         overlay.frame_fps = frame_rate_.rate();           // 处理帧率
         overlay.inference_fps = inference_rate_.rate();   // 推理帧率
         overlay.frames_captured = captured_frames_.load(std::memory_order_relaxed);  // 累计采集帧数
@@ -570,11 +615,25 @@ void V4l2CameraPipeline::processingLoop() {
         overlay.detections_valid = draw_cached;          // 检测结果是否有效
         overlay.detection_mono_ns = detection_mono_ns;   // 检测时间戳
 
-        // 调用外部回调函数，将处理完成的帧推送到 FrameHub 供下游（如 MosaicStreamPipeline）消费
-        if (frame_callback_) frame_callback_(frame, timestamp, capture_mono_ns, overlay);
-
-        // 将缓冲区重新入队，归还给 V4L2 驱动继续采集
-        if (!queueBuffer(static_cast<uint32_t>(buffer_index))) online_.store(false);
+        // 原始NV12/NV21 DMA缓冲直接交给FrameHub。lease析构时才QBUF，确保RGA
+        // 合成完成前摄像头驱动不会覆盖当前帧。
+        FrameHub::DmaFrame dma_frame;
+        dma_frame.fd = capture_buffer.dma_fd;
+        dma_frame.width = config_.width;
+        dma_frame.height = config_.height;
+        dma_frame.width_stride = stride_;
+        dma_frame.height_stride = height_stride_;
+        dma_frame.buffer_size = capture_buffer.length;
+        dma_frame.rotation = config_.rotation;
+        dma_frame.format = fourcc_ == V4L2_PIX_FMT_NV21
+            ? DmaPixelFormat::NV21 : DmaPixelFormat::NV12;
+        dma_frame.color_space = dma_color_space_;
+        dma_frame.lease = std::make_shared<V4l2BufferLease>(
+            requeue_state_, static_cast<uint32_t>(buffer_index));
+        if (dma_frame.valid() && frame_callback_) {
+            frame_callback_(dma_frame, timestamp, capture_mono_ns, overlay);
+        }
+        // 无消费者或发布失败时，局部lease在本轮结束立即归还缓冲。
     }
 }
 
@@ -597,7 +656,7 @@ void V4l2CameraPipeline::inferenceLoop() {
             });
             if (!running_.load()) break;                 // 停止信号，退出
             if (!inference_pending_ || inference_frame_.empty()) continue; // 无待处理任务
-            frame = inference_frame_;                    // 取出帧数据
+            frame = std::move(inference_frame_);         // 转移帧引用，避免成员滞留上一帧内存
             timestamp = inference_timestamp_;             // 取出时间戳
             capture_mono_ns = inference_mono_ns_;         // 取出采集纳秒
             inference_pending_ = false;                   // 清除待处理标志

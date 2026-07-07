@@ -84,16 +84,15 @@ uint8_t parseModelMask(const std::string& value) {
 }
 
 // =============================================================================
-// publishFrameToHub —— 帧发布至 FrameHub（多路汇聚链路的核心粘合函数）
+// publishDmaFrameToHub —— DMA帧发布至FrameHub（多路汇聚链路的核心粘合函数）
 // =============================================================================
-void publishFrameToHub(AppContext& context,
-                       pipeline::FrameSource source,
-                       const cv::Mat& frame,
-                       std::chrono::system_clock::time_point ts,
-                       int64_t capture_mono_ns,
-                       const pipeline::FrameHub::FrameOverlay& overlay) {
-    cv::Mat frame_view = frame;
-    context.frame_hub->update(source, std::move(frame_view), ts, capture_mono_ns, overlay);
+void publishDmaFrameToHub(AppContext& context,
+                          pipeline::FrameSource source,
+                          const pipeline::FrameHub::DmaFrame& frame,
+                          std::chrono::system_clock::time_point ts,
+                          int64_t capture_mono_ns,
+                          const pipeline::FrameHub::FrameOverlay& overlay) {
+    context.frame_hub->updateDma(source, frame, ts, capture_mono_ns, overlay);
 }
 
 // =============================================================================
@@ -383,10 +382,12 @@ bool AppInitializer::initialize(AppContext& context) {
 //   先停下游（管线） -> 推理服务（管线依赖） -> 分发器 -> 温控 -> MQTT -> 存储
 // =============================================================================
 void AppInitializer::shutdown(AppContext& context) {
-    // 先停视频管线：防止下游仍在消费数据
+    // 先停最下游，确保不再有RGA任务读取采集DMA缓冲。
+    if (context.mosaic_pipeline) context.mosaic_pipeline->stop();
+    // 再停生产者；V4L2租约状态会先失效，残留快照随后clear时不会对关闭FD执行QBUF。
     if (context.external_rtsp_pipeline) context.external_rtsp_pipeline->stop();
     if (context.imx415_pipeline) context.imx415_pipeline->stop();
-    if (context.mosaic_pipeline) context.mosaic_pipeline->stop();
+    if (context.frame_hub) context.frame_hub->clear();
 
     // 共享推理服务必须在所有管线 stop 之后释放（管线推理线程依赖此服务）
     if (context.inference_service) {
@@ -616,9 +617,9 @@ void AppInitializer::initExternalRtspPipeline(AppContext& context, const std::st
     // 帧推送回调：处理后帧 -> FrameHub（供 Mosaic 拼接消费）
     //lambda表达式：回调函数Callback_func([参数捕获列表](回调参数列表){code 回调函数本体})
     context.external_rtsp_pipeline->setFrameCallback(
-        [&context](const cv::Mat& frame, std::chrono::system_clock::time_point ts,
+        [&context](const pipeline::FrameHub::DmaFrame& frame, std::chrono::system_clock::time_point ts,
                    int64_t mono_ns, const pipeline::FrameHub::FrameOverlay& overlay) {
-            publishFrameToHub(context, pipeline::FrameSource::ExternalRtsp, frame, ts, mono_ns, overlay);
+            publishDmaFrameToHub(context, pipeline::FrameSource::ExternalRtsp, frame, ts, mono_ns, overlay);
         });
 
     if (!pipeline_start(context.external_rtsp_pipeline) &&
@@ -647,9 +648,9 @@ void AppInitializer::initImx415Pipeline(AppContext& context, const std::string& 
     context.imx415_pipeline->setInferenceService(context.inference_service.get());
     context.imx415_pipeline->setInferenceCallback(inference_writer(STREAM_ID_IMX415));
     context.imx415_pipeline->setFrameCallback(
-        [&context](const cv::Mat& frame, std::chrono::system_clock::time_point ts,
+        [&context](const pipeline::FrameHub::DmaFrame& frame, std::chrono::system_clock::time_point ts,
                    int64_t mono_ns, const pipeline::FrameHub::FrameOverlay& overlay) {
-            publishFrameToHub(context, pipeline::FrameSource::Imx415, frame, ts, mono_ns, overlay);
+            publishDmaFrameToHub(context, pipeline::FrameSource::Imx415, frame, ts, mono_ns, overlay);
         });
 
     if (!pipeline_start(context.imx415_pipeline) &&

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include "rga.h"
 #include "im2d.h"
@@ -79,16 +80,29 @@ private:
     cv::Mat letterbox_resized_buf_;
     int mat_preproc_width_ = 0;
     int mat_preproc_height_ = 0;
-    int fd_preproc_width_ = 0;
-    int fd_preproc_height_ = 0;
+    rknn_tensor_mem* input_mem_ = nullptr;      // RKNN 分配、RGA/NPU 共享的输入 DMA-BUF
+    rknn_tensor_attr bound_input_attr_{};       // rknn_set_io_mem 实际绑定的外部输入属性
+    rknn_tensor_attr native_input_attr_{};      // NPU 原生输入属性（用于诊断/约束检查）
+    int input_wstride_ = 0;                     // RGB 输入像素步长（不是字节数）
+    int input_hstride_ = 0;
+    bool zero_copy_input_ready_ = false;
+    bool prepared_input_ready_ = false;
+    float prepared_scale_w_ = 1.0F;
+    float prepared_scale_h_ = 1.0F;
+    float prepared_pad_x_ = 0.0F;
+    float prepared_pad_y_ = 0.0F;
+    bool fd_padding_valid_ = false;
+    int fd_last_resized_w_ = 0;
+    int fd_last_resized_h_ = 0;
+    int fd_last_offset_x_ = 0;
+    int fd_last_offset_y_ = 0;
 
     bool preprocessMatLetterbox(const cv::Mat& source,
                                 float& scale_w, float& scale_h,
                                 float& pad_x, float& pad_y);
-    bool preprocessFdLetterbox(int src_fd, int src_width, int src_height, int src_stride,
-                               int src_height_stride, size_t src_buffer_size,
-                               float& scale_w, float& scale_h,
-                               float& pad_x, float& pad_y);
+    bool initializeBoundInput();
+    bool copyMatToBoundInput(const cv::Mat& source);
+    bool validateOutputLayout() const;
 
 public:
     Mat ori_img;                     // 原始图像
@@ -100,23 +114,27 @@ public:
      */
     int interf(detect_result_group_t &detect_result_group, bool draw_result = true,
                std::mutex* npu_mutex = nullptr);
-    int interfFromFd(detect_result_group_t &detect_result_group,
-                     int src_fd,
-                     int src_width,
-                     int src_height,
-                     int src_stride,
-                     int src_height_stride,
-                     size_t src_buffer_size,
-                     bool draw_result = false,
-                     std::mutex* npu_mutex = nullptr);
+    // 两阶段 FD 推理：先完成所有模型的 RGA 读取，再释放源帧，最后串行运行 NPU。
+    int prepareFromFd(int src_fd, int src_width, int src_height,
+                      int src_stride, int src_height_stride,
+                      size_t src_buffer_size,
+                      pipeline::RgaPixelFormat src_format = pipeline::RgaPixelFormat::NV12);
+    int inferPrepared(detect_result_group_t &detect_result_group,
+                      std::mutex* npu_mutex = nullptr);
 
     /**
      * @brief 设置共享预处理缓冲区（同源多模型跳过重复RGA）
      * @param buf 已经过RGA预处理的RGB 640x640图像
      */
-    void setSharedPreproc(const cv::Mat& buf) {
+    bool setSharedPreproc(const cv::Mat& buf) {
+        rga_preproc_skip_ = false;
+        if (buf.empty() || buf.type() != CV_8UC3 ||
+            buf.cols != width || buf.rows != height) {
+            return false;
+        }
         buf.copyTo(rga_output_buf_);
         rga_preproc_skip_ = true;
+        return true;
     }
     const cv::Mat& getPreprocessedBuf() const { return rga_output_buf_; }
 
@@ -142,6 +160,7 @@ public:
      * 此方法供上层（如 InferenceService）在构造后验证有效性。
      */
     bool isValid() const { return rkModel != 0 && input_attrs != nullptr && output_attrs != nullptr; }
+    bool supportsFdInput() const { return isValid() && fd_hw_path_ready_ && zero_copy_input_ready_; }
 
     /**
      * @brief 构造函数
@@ -233,6 +252,16 @@ rknn_lite::rknn_lite(char *model_name, int n, int class_num, int id,
         output_attrs = nullptr;
         return;
     }
+    if (io_num.n_input != 1 || io_num.n_output == 0)
+    {
+        fprintf(stderr, "[rknn_lite] model id=%d: unsupported IO count input=%u output=%u\n",
+                id, io_num.n_input, io_num.n_output);
+        rknn_destroy(rkModel);
+        rkModel = 0;
+        input_attrs = nullptr;
+        output_attrs = nullptr;
+        return;
+    }
 
     // 6：查询输入张量属性
     input_attrs = new rknn_tensor_attr[io_num.n_input];
@@ -280,6 +309,17 @@ rknn_lite::rknn_lite(char *model_name, int n, int class_num, int id,
     }
 
     // 8：输入维度解析
+    if (input_attrs[0].n_dims != 4 || input_attrs[0].dims[0] != 1)
+    {
+        fprintf(stderr, "[rknn_lite] model id=%d: only static batch-1 4D input is supported\n", id);
+        delete[] input_attrs;
+        delete[] output_attrs;
+        input_attrs = nullptr;
+        output_attrs = nullptr;
+        rknn_destroy(rkModel);
+        rkModel = 0;
+        return;
+    }
     if (input_attrs[0].fmt == RKNN_TENSOR_NCHW)
     {
         channel = input_attrs[0].dims[1];//获取通道数
@@ -291,6 +331,32 @@ rknn_lite::rknn_lite(char *model_name, int n, int class_num, int id,
         height = input_attrs[0].dims[1];//获取高度
         width = input_attrs[0].dims[2];//获取宽度
         channel = input_attrs[0].dims[3];//获取通道数
+    }
+    if (width <= 0 || height <= 0 || width % 32 != 0 || height % 32 != 0 || channel != 3 ||
+        (input_attrs[0].fmt != RKNN_TENSOR_NCHW &&
+         input_attrs[0].fmt != RKNN_TENSOR_NHWC))
+    {
+        fprintf(stderr,
+                "[rknn_lite] model id=%d: unsupported input shape/format %dx%dx%d fmt=%d\n",
+                id, height, width, channel, input_attrs[0].fmt);
+        delete[] input_attrs;
+        delete[] output_attrs;
+        input_attrs = nullptr;
+        output_attrs = nullptr;
+        rknn_destroy(rkModel);
+        rkModel = 0;
+        return;
+    }
+    if (!validateOutputLayout())
+    {
+        fprintf(stderr, "[rknn_lite] model id=%d: unsupported output tensor layout\n", id);
+        delete[] input_attrs;
+        delete[] output_attrs;
+        input_attrs = nullptr;
+        output_attrs = nullptr;
+        rknn_destroy(rkModel);
+        rkModel = 0;
+        return;
     }
     // 9：输入参数配置
     memset(inputs, 0, sizeof(inputs));//初始化输入数据
@@ -328,6 +394,144 @@ rknn_lite::rknn_lite(char *model_name, int n, int class_num, int id,
 
     // 预分配RGA输出缓冲区（模型输入尺寸），避免每帧堆分配
     rga_output_buf_.create(height, width, CV_8UC3);
+
+    // 绑定一块由 RKNN 分配的 DMA-BUF。绑定失败不影响传统 Mat 路径，但会禁用
+    // FD 直通，避免悄悄回退到带 CPU 拷贝的伪零拷贝路径。
+    zero_copy_input_ready_ = initializeBoundInput();
+    fd_hw_path_ready_ = fd_hw_path_ready_ && zero_copy_input_ready_;
+    if (!zero_copy_input_ready_)
+    {
+        fprintf(stderr, "[rknn_lite] model id=%d: RKNN bound input unavailable; FD path disabled.\n", id);
+    }
+}
+
+bool rknn_lite::validateOutputLayout() const
+{
+    if (!output_attrs || width <= 0 || height <= 0) return false;
+    auto is_int8_nchw = [](const rknn_tensor_attr& attr) {
+        return attr.type == RKNN_TENSOR_INT8 && attr.fmt == RKNN_TENSOR_NCHW &&
+               attr.n_dims == 4 && attr.dims[0] == 1;
+    };
+
+    if (io_num.n_output < 6 || io_num.n_output % 3 != 0) return false;
+    const uint32_t per_branch = io_num.n_output / 3;
+    if (per_branch != 2 && per_branch != 3) return false;
+    for (uint32_t branch = 0; branch < 3; ++branch)
+    {
+        const auto& box = output_attrs[branch * per_branch];
+        const auto& score = output_attrs[branch * per_branch + 1];
+        if (!is_int8_nchw(box) || !is_int8_nchw(score) || box.dims[1] % 4 != 0 ||
+            static_cast<int>(score.dims[1]) < class_num ||
+            box.dims[2] != score.dims[2] || box.dims[3] != score.dims[3]) return false;
+        if (per_branch == 3)
+        {
+            const auto& sum = output_attrs[branch * per_branch + 2];
+            if (!is_int8_nchw(sum) || sum.dims[1] != 1 ||
+                sum.dims[2] != box.dims[2] || sum.dims[3] != box.dims[3]) return false;
+        }
+    }
+    return true;
+}
+
+bool rknn_lite::initializeBoundInput()
+{
+    if (rkModel == 0 || input_attrs == nullptr || io_num.n_input != 1 ||
+        width <= 0 || height <= 0 || channel != 3)
+    {
+        return false;
+    }
+
+    memset(&native_input_attr_, 0, sizeof(native_input_attr_));
+    native_input_attr_.index = 0;
+    const int native_ret = rknn_query(rkModel, RKNN_QUERY_NATIVE_INPUT_ATTR,
+                                      &native_input_attr_, sizeof(native_input_attr_));
+    if (native_ret < 0)
+    {
+        // 部分旧版 RK3568 runtime 不支持 native attr 查询；外部 UINT8/NHWC
+        // 绑定仍可依据普通 INPUT_ATTR 工作。
+        memset(&native_input_attr_, 0, sizeof(native_input_attr_));
+    }
+    else
+    {
+        fprintf(stderr,
+                "[rknn_lite] model id=%d: native input type=%d fmt=%d stride=%ux%u size=%u\n",
+                id, native_input_attr_.type, native_input_attr_.fmt,
+                native_input_attr_.w_stride, native_input_attr_.h_stride,
+                native_input_attr_.size_with_stride);
+    }
+
+    bound_input_attr_ = input_attrs[0];
+    bound_input_attr_.index = 0;
+    bound_input_attr_.type = RKNN_TENSOR_UINT8;
+    bound_input_attr_.fmt = RKNN_TENSOR_NHWC;
+    bound_input_attr_.pass_through = 0;  // runtime 按模型属性完成必要的量化/布局转换
+    input_wstride_ = input_attrs[0].w_stride > 0
+        ? static_cast<int>(input_attrs[0].w_stride) : width;
+    input_hstride_ = height;
+    if (input_wstride_ < width) return false;
+
+    const uint64_t required_size = static_cast<uint64_t>(input_wstride_) *
+                                   input_hstride_ * channel;
+    if (required_size == 0 || required_size > std::numeric_limits<uint32_t>::max())
+    {
+        return false;
+    }
+    const uint32_t allocation_size = input_attrs[0].size_with_stride > 0
+        ? input_attrs[0].size_with_stride : input_attrs[0].size;
+    // RKNN 官方零拷贝接口要求使用查询得到的 size_with_stride。若它不足以
+    // 容纳 UINT8/NHWC RGB 布局，说明该 runtime/model 组合不能安全走此路径。
+    if (allocation_size < required_size) return false;
+    bound_input_attr_.w_stride = static_cast<uint32_t>(input_wstride_);
+    bound_input_attr_.h_stride = static_cast<uint32_t>(input_hstride_);
+    bound_input_attr_.size = static_cast<uint32_t>(
+        static_cast<uint64_t>(width) * height * channel);
+    bound_input_attr_.size_with_stride = allocation_size;
+
+    input_mem_ = rknn_create_mem(rkModel, allocation_size);
+    if (!input_mem_ || input_mem_->fd < 0 || input_mem_->size < required_size)
+    {
+        if (input_mem_) rknn_destroy_mem(rkModel, input_mem_);
+        input_mem_ = nullptr;
+        return false;
+    }
+    ret = rknn_set_io_mem(rkModel, input_mem_, &bound_input_attr_);
+    if (ret < 0)
+    {
+        rknn_destroy_mem(rkModel, input_mem_);
+        input_mem_ = nullptr;
+        return false;
+    }
+
+    fprintf(stderr,
+            "[rknn_lite] model id=%d: input DMA bound %dx%dx%d stride=%dx%d size=%u fd=%d\n",
+            id, width, height, channel, input_wstride_, input_hstride_,
+            input_mem_->size, input_mem_->fd);
+    return true;
+}
+
+bool rknn_lite::copyMatToBoundInput(const cv::Mat& source)
+{
+    if (!zero_copy_input_ready_ || !input_mem_ || !input_mem_->virt_addr ||
+        source.empty() || source.type() != CV_8UC3 ||
+        source.cols != width || source.rows != height)
+    {
+        return false;
+    }
+    const size_t row_bytes = static_cast<size_t>(width) * channel;
+    const size_t target_row_bytes = static_cast<size_t>(input_wstride_) * channel;
+    auto* destination = static_cast<uint8_t*>(input_mem_->virt_addr);
+    for (int row = 0; row < height; ++row)
+    {
+        memcpy(destination + static_cast<size_t>(row) * target_row_bytes,
+               source.ptr(row), row_bytes);
+        if (target_row_bytes > row_bytes)
+        {
+            memset(destination + static_cast<size_t>(row) * target_row_bytes + row_bytes,
+                   114, target_row_bytes - row_bytes);
+        }
+    }
+    fd_padding_valid_ = false; // Mat 内容区域可能与下一帧 FD 的 ROI 不同
+    return rknn_mem_sync(rkModel, input_mem_, RKNN_MEMORY_SYNC_TO_DEVICE) >= 0;
 }
 
 /**
@@ -353,6 +557,11 @@ bool rknn_lite::setCoreMask(rknn_core_mask mask)
  */
 rknn_lite::~rknn_lite()
 {
+    if (input_mem_ && rkModel)
+    {
+        rknn_destroy_mem(rkModel, input_mem_);
+        input_mem_ = nullptr;
+    }
     if (rkModel)
     {
         ret = rknn_destroy(rkModel);
@@ -383,8 +592,10 @@ bool rknn_lite::preprocessMatLetterbox(const cv::Mat& source,
     if (source.empty()) return false;
     const float scale = std::min(static_cast<float>(width) / source.cols,
                                  static_cast<float>(height) / source.rows);
-    const int resized_w = std::max(2, static_cast<int>(std::round(source.cols * scale)));
-    const int resized_h = std::max(2, static_cast<int>(std::round(source.rows * scale)));
+    const int resized_w = std::min(width, std::max(2,
+        static_cast<int>(std::round(source.cols * scale)) & ~1));
+    const int resized_h = std::min(height, std::max(2,
+        static_cast<int>(std::round(source.rows * scale)) & ~1));
     if (mat_preproc_width_ != resized_w || mat_preproc_height_ != resized_h) {
         pipeline::RgaPreprocessConfig cfg;
         cfg.use_rga = true;
@@ -410,45 +621,6 @@ bool rknn_lite::preprocessMatLetterbox(const cv::Mat& source,
     return true;
 }
 
-bool rknn_lite::preprocessFdLetterbox(int src_fd, int src_width, int src_height, int src_stride,
-                                      int src_height_stride, size_t src_buffer_size,
-                                      float& scale_w, float& scale_h,
-                                      float& pad_x, float& pad_y)
-{
-    const float scale = std::min(static_cast<float>(width) / src_width,
-                                 static_cast<float>(height) / src_height);
-    // NV12硬件缩放要求宽高为偶数。
-    const int resized_w = std::max(2, static_cast<int>(std::round(src_width * scale)) & ~1);
-    const int resized_h = std::max(2, static_cast<int>(std::round(src_height * scale)) & ~1);
-    if (fd_preproc_width_ != resized_w || fd_preproc_height_ != resized_h) {
-        pipeline::RgaPreprocessConfig cfg;
-        cfg.use_rga = true;
-        cfg.strict_hardware = true;
-        cfg.target_width = resized_w;
-        cfg.target_height = resized_h;
-        cfg.src_format = pipeline::RgaPixelFormat::NV12;
-        cfg.dst_format = pipeline::RgaPixelFormat::RGB888;
-        rga_fd_preproc_.initialize(cfg);
-        fd_preproc_width_ = resized_w;
-        fd_preproc_height_ = resized_h;
-        fd_hw_path_ready_ = rga_fd_preproc_.isRgaActive();
-    }
-    if (!fd_hw_path_ready_ || !rga_fd_preproc_.processFromFd(
-            src_fd, src_width, src_height, src_stride, letterbox_resized_buf_,
-            src_height_stride, src_buffer_size)) return false;
-    rga_output_buf_.create(height, width, CV_8UC3);
-    rga_output_buf_.setTo(cv::Scalar(114, 114, 114));
-    const int left = (width - resized_w) / 2;
-    const int top = (height - resized_h) / 2;
-    letterbox_resized_buf_.copyTo(
-        rga_output_buf_(cv::Rect(left, top, resized_w, resized_h)));
-    scale_w = static_cast<float>(resized_w) / src_width;
-    scale_h = static_cast<float>(resized_h) / src_height;
-    pad_x = static_cast<float>(left);
-    pad_y = static_cast<float>(top);
-    return true;
-}
-
 /**
  * @brief 通过 DMA-BUF FD 直接进行推理（硬件直通路径）
  * @param detect_result_group 存储检测结果的结构体
@@ -459,111 +631,117 @@ bool rknn_lite::preprocessFdLetterbox(int src_fd, int src_width, int src_height,
  * @param draw_result 是否绘制结果（FD路径通常设为false，在外部按需绘制）
  * @return 0 表示成功，-1 表示失败
  */
-int rknn_lite::interfFromFd(detect_result_group_t &detect_result_group,
-                          int src_fd,
-                          int src_width,
-                          int src_height,
-                          int src_stride,
-                          int src_height_stride,
-                          size_t src_buffer_size,
-                          bool draw_result,
-                          std::mutex* npu_mutex)
+int rknn_lite::prepareFromFd(int src_fd, int src_width, int src_height,
+                             int src_stride, int src_height_stride,
+                             size_t src_buffer_size,
+                             pipeline::RgaPixelFormat src_format)
 {
-    (void)draw_result;
-    // 1. 基础有效性检查：确保模型已加载且输入参数合法
-    if (rkModel == 0 || input_attrs == nullptr || output_attrs == nullptr || src_fd <= 0 || src_width <= 0 || src_height <= 0)
+    prepared_input_ready_ = false;
+    if (rkModel == 0 || !fd_hw_path_ready_ || !zero_copy_input_ready_ ||
+        !input_mem_ || src_fd < 0 || src_width <= 0 || src_height <= 0)
+    {
+        return -1;
+    }
+    const int source_stride = src_stride > 0 ? src_stride : src_width;
+    const int source_height_stride = src_height_stride > 0
+        ? src_height_stride : src_height;
+    if (source_stride < src_width || source_height_stride < src_height)
     {
         return -1;
     }
 
-    // FD直通为严格硬件路径：RGA不可用时不回退CPU，直接返回失败
-    if (!fd_hw_path_ready_)
+    const float scale = std::min(static_cast<float>(width) / src_width,
+                                 static_cast<float>(height) / src_height);
+    int resized_w = std::min(width, std::max(2,
+        static_cast<int>(std::round(src_width * scale)) & ~1));
+    int resized_h = std::min(height, std::max(2,
+        static_cast<int>(std::round(src_height * scale)) & ~1));
+    if (resized_w <= 0 || resized_h <= 0) return -1;
+    const int left = (width - resized_w) / 2;
+    const int top = (height - resized_h) / 2;
+    const bool clear_padding = !fd_padding_valid_ ||
+        resized_w != fd_last_resized_w_ || resized_h != fd_last_resized_h_ ||
+        left != fd_last_offset_x_ || top != fd_last_offset_y_;
+
+    if (!rga_fd_preproc_.processFdToFdLetterbox(
+            src_fd, src_width, src_height, source_stride, source_height_stride,
+            src_buffer_size, src_format, input_mem_->fd, width, height,
+            input_wstride_, input_hstride_, input_mem_->size,
+            resized_w, resized_h, left, top, clear_padding, 114))
     {
+        fd_padding_valid_ = false;
         return -1;
     }
 
-    // 部分采集链路不提供stride，默认按宽度兜底
-    if (src_stride <= 0)
-    {
-        src_stride = src_width;
-    }
+    fd_padding_valid_ = true;
+    fd_last_resized_w_ = resized_w;
+    fd_last_resized_h_ = resized_h;
+    fd_last_offset_x_ = left;
+    fd_last_offset_y_ = top;
 
-    float scale_w = 1.0F, scale_h = 1.0F, pad_x = 0.0F, pad_y = 0.0F;
-    // 保持宽高比的YOLOv8 letterbox，避免把16:9/竖屏画面强拉成640×640。
-    if (!preprocessFdLetterbox(src_fd, src_width, src_height, src_stride,
-                               src_height_stride, src_buffer_size,
-                               scale_w, scale_h, pad_x, pad_y) || rga_output_buf_.empty())
-    {
-        return -1;
-    }
+    prepared_scale_w_ = static_cast<float>(resized_w) / src_width;
+    prepared_scale_h_ = static_cast<float>(resized_h) / src_height;
+    prepared_pad_x_ = static_cast<float>(left);
+    prepared_pad_y_ = static_cast<float>(top);
+    prepared_input_ready_ = true;
+    return 0;
+}
 
-    // RGA 前处理在全局 NPU 锁外执行；仅序列化真正访问 NPU/runtime 的阶段。
-    std::unique_lock<std::mutex> npu_lock;
-    if (npu_mutex) npu_lock = std::unique_lock<std::mutex>(*npu_mutex);
+int rknn_lite::inferPrepared(detect_result_group_t &detect_result_group,
+                             std::mutex* npu_mutex)
+{
+    if (!prepared_input_ready_ || rkModel == 0 || !input_mem_) return -1;
+    prepared_input_ready_ = false;
+    const float scale_w = prepared_scale_w_;
+    const float scale_h = prepared_scale_h_;
+    const float pad_x = prepared_pad_x_;
+    const float pad_y = prepared_pad_y_;
 
-    // 3. 设置模型输入：将转换后的图像数据指针送入 RKNN 输入缓冲区
-    inputs[0].buf = (void *)rga_output_buf_.data;
-    ret = rknn_inputs_set(rkModel, io_num.n_input, inputs);// 将预处理后的图像数据设置为 RKNN 输入
-    if (ret < 0)
-    {
-        return -1;
-    }
-
-    // 4. 执行推理：调用 NPU 硬件加速器开始计算
     rknn_output outputs[io_num.n_output];
     memset(outputs, 0, sizeof(outputs));
-    for (uint32_t i = 0; i < io_num.n_output; i++)
-        outputs[i].want_float = 0; // 0表示量化输出，高效利用计算资源
+    for (uint32_t i = 0; i < io_num.n_output; ++i) outputs[i].want_float = 0;
 
-    ret = rknn_run(rkModel, NULL);
-    if (ret < 0)
     {
-        return -1;
+        // Only RKNN runtime/NPU operations hold the global NPU lock. RGA and CPU
+        // post-processing remain outside it so other model contexts can progress.
+        std::unique_lock<std::mutex> npu_lock;
+        if (npu_mutex) npu_lock = std::unique_lock<std::mutex>(*npu_mutex);
+        ret = rknn_run(rkModel, nullptr);
+        if (ret < 0) return -1;
+        ret = rknn_outputs_get(rkModel, io_num.n_output, outputs, nullptr);
+        if (ret < 0) return -1;
     }
 
-    // 5. 获取输出结果：从 NPU 获取原始推理预测张量
-    ret = rknn_outputs_get(rkModel, io_num.n_output, outputs, NULL);
-    if (ret < 0)
-    {
-        return -1;
-    }
-    if (npu_lock.owns_lock()) npu_lock.unlock();
-
-    // 6. 坐标映射准备：计算模型坐标到原始画面坐标的缩放系数
     const float nms_threshold = nms_threshold_;
     const float box_conf_threshold = confidence_threshold_;
-
-    // 7. 提取反量化参数：获取输出张量的 Scale 和零点(ZeroPoint)
-    std::vector<float> out_scales;
-    std::vector<int32_t> out_zps;
-    out_scales.reserve(io_num.n_output);
-    out_zps.reserve(io_num.n_output);
-    for (uint32_t i = 0; i < io_num.n_output; ++i)
-    {
-        out_scales.push_back(output_attrs[i].scale);
-        out_zps.push_back(output_attrs[i].zp);
-    }
-
-    // 8. 结果后处理：执行 NMS (非极大值抑制) 并将坐标映射回原始尺度
-    // 该步骤将模型输出转换为可读的检测框、类别和置信度
-    if (io_num.n_output >= 6 && io_num.n_output % 3 == 0) {
-        std::vector<void*> output_buffers(io_num.n_output);
-        for (uint32_t i = 0; i < io_num.n_output; ++i) output_buffers[i] = outputs[i].buf;
-        ret = post_process_yolov8(output_buffers, output_attrs, io_num.n_output,
-            height, width, box_conf_threshold, nms_threshold, scale_w, scale_h, pad_x, pad_y,
-            &detect_result_group, class_num, label_path_);
-    } else if (io_num.n_output == 3) {
-        ret = post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
-            box_conf_threshold, nms_threshold, scale_w, scale_h, out_zps, out_scales,
-            &detect_result_group, class_num, label_path_);
-    } else {
-        fprintf(stderr, "[rknn_lite] unsupported output count: %u\n", io_num.n_output);
+    try {
+        if (io_num.n_output >= 6 && io_num.n_output % 3 == 0)
+        {
+            std::vector<void*> output_buffers(io_num.n_output);
+            for (uint32_t i = 0; i < io_num.n_output; ++i) output_buffers[i] = outputs[i].buf;
+            ret = post_process_yolov8(output_buffers, output_attrs, io_num.n_output,
+                height, width, box_conf_threshold, nms_threshold,
+                scale_w, scale_h, pad_x, pad_y,
+                &detect_result_group, class_num, label_path_);
+        }
+        else ret = -1;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[rknn_lite] postprocess exception: %s\n", error.what());
+        ret = -1;
+    } catch (...) {
+        fprintf(stderr, "[rknn_lite] postprocess unknown exception\n");
         ret = -1;
     }
 
-    // 9. 释放输出资源：必须及时释放 RKNN 输出缓冲区，防止显存泄漏
     const int postprocess_ret = ret;
-    rknn_outputs_release(rkModel, io_num.n_output, outputs);
+    {
+        std::unique_lock<std::mutex> npu_lock;
+        if (npu_mutex) npu_lock = std::unique_lock<std::mutex>(*npu_mutex);
+        if (rknn_outputs_release(rkModel, io_num.n_output, outputs) < 0)
+        {
+            return -1;
+        }
+    }
     return postprocess_ret;
 }
 
@@ -574,7 +752,7 @@ int rknn_lite::interfFromFd(detect_result_group_t &detect_result_group,
  * @return 0 表示成功，-1 表示失败
  *
  * 注意：此方法用于 Mat 输入场景（离线图像、非FD红外链路等），
- *       硬件直通 DMA-BUF FD 主链路优先使用 interfFromFd。
+ *       硬件直通 DMA-BUF FD 主链路使用 prepareFromFd()+inferPrepared()。
  */
 int rknn_lite::interf(detect_result_group_t &detect_result_group, bool draw_result,
                       std::mutex* npu_mutex)
@@ -585,25 +763,28 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group, bool draw_resu
         return -1;
     }
 
-    cv::Mat img; // 用于存储预处理（缩放、格式转换）后的图像
-    
+    cv::Mat source = ori_img; // 局部 header 保持本次调用期间的数据生命周期
+    ori_img.release();        // 不让模型成员跨帧长期持有大分辨率 BGR 缓冲
+
     // 获取输入图像的原始属性
-    int img_width = ori_img.cols;  // 原始图像宽度
-    int img_height = ori_img.rows; // 原始图像高度
+    int img_width = source.cols;  // 原始图像宽度
+    int img_height = source.rows; // 原始图像高度
     
     float scale_w = 1.0F, scale_h = 1.0F, pad_x = 0.0F, pad_y = 0.0F;
     // 2. 预处理：优先使用共享letterbox缓冲区，否则走RGA。
     if (!rga_preproc_skip_) {
         if (!preprocessMatLetterbox(
-                ori_img, scale_w, scale_h, pad_x, pad_y)) {
+                source, scale_w, scale_h, pad_x, pad_y)) {
             return -1;
         }
     } else {
         rga_preproc_skip_ = false;
         const float scale = std::min(static_cast<float>(width) / img_width,
                                      static_cast<float>(height) / img_height);
-        const int resized_w = std::max(2, static_cast<int>(std::round(img_width * scale)));
-        const int resized_h = std::max(2, static_cast<int>(std::round(img_height * scale)));
+        const int resized_w = std::min(width, std::max(2,
+            static_cast<int>(std::round(img_width * scale)) & ~1));
+        const int resized_h = std::min(height, std::max(2,
+            static_cast<int>(std::round(img_height * scale)) & ~1));
         scale_w = static_cast<float>(resized_w) / img_width;
         scale_h = static_cast<float>(resized_h) / img_height;
         pad_x = static_cast<float>((width - resized_w) / 2);
@@ -615,15 +796,22 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group, bool draw_resu
         return -1;
     }
 
+    // set_io_mem 一旦绑定后，两条输入路径必须写入同一块内存。Mat 路径按
+    // RKNN 的真实 stride 逐行写入并显式同步 CPU cache。
+    if (zero_copy_input_ready_ && !copyMatToBoundInput(rga_output_buf_))
+    {
+        return -1;
+    }
+
     std::unique_lock<std::mutex> npu_lock;
     if (npu_mutex) npu_lock = std::unique_lock<std::mutex>(*npu_mutex);
 
-    // 3. 设置模型输入：将转换后的像素数据拷贝到 RKNN 内部输入缓冲区
-    inputs[0].buf = (void *)rga_output_buf_.data;
-    ret = rknn_inputs_set(rkModel, io_num.n_input, inputs);
-    if (ret < 0)
+    // 未绑定 DMA 输入时保留兼容路径；正常板端路径不再调用 rknn_inputs_set。
+    if (!zero_copy_input_ready_)
     {
-        return -1;
+        inputs[0].buf = (void *)rga_output_buf_.data;
+        ret = rknn_inputs_set(rkModel, io_num.n_input, inputs);
+        if (ret < 0) return -1;
     }
 
     // 4. 执行推理：触发 NPU 硬件进行神经网络计算
@@ -652,33 +840,31 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group, bool draw_resu
 
     // 计算坐标映射因子：用于将模型输出的归一化坐标还原到原始图像尺度
     // 7. 量化参数转换：获取模型训练时保留的 Scale 和 ZeroPoint 用于反量化
-    std::vector<float> out_scales;
-    std::vector<int32_t> out_zps;
-    out_scales.reserve(io_num.n_output);
-    out_zps.reserve(io_num.n_output);
-    for (uint32_t i = 0; i < io_num.n_output; ++i)
-    {
-        out_scales.push_back(output_attrs[i].scale);
-        out_zps.push_back(output_attrs[i].zp);
-    }
-
     // 8. 结果解析：执行后处理算法，将原始张量转换为具体的检测框坐标和类别
-    if (io_num.n_output >= 6 && io_num.n_output % 3 == 0) {
-        std::vector<void*> output_buffers(io_num.n_output);
-        for (uint32_t i = 0; i < io_num.n_output; ++i) output_buffers[i] = outputs[i].buf;
-        ret = post_process_yolov8(output_buffers, output_attrs, io_num.n_output,
-            height, width, box_conf_threshold, nms_threshold, scale_w, scale_h, pad_x, pad_y,
-            &detect_result_group, class_num, label_path_);
-    } else if (io_num.n_output == 3) {
-        ret = post_process((int8_t *)outputs[0].buf, (int8_t *)outputs[1].buf, (int8_t *)outputs[2].buf, height, width,
-            box_conf_threshold, nms_threshold, scale_w, scale_h, out_zps, out_scales,
-            &detect_result_group, class_num, label_path_);
-    } else {
-        fprintf(stderr, "[rknn_lite] unsupported output count: %u\n", io_num.n_output);
+    try {
+        if (io_num.n_output >= 6 && io_num.n_output % 3 == 0) {
+            std::vector<void*> output_buffers(io_num.n_output);
+            for (uint32_t i = 0; i < io_num.n_output; ++i) output_buffers[i] = outputs[i].buf;
+            ret = post_process_yolov8(output_buffers, output_attrs, io_num.n_output,
+                height, width, box_conf_threshold, nms_threshold, scale_w, scale_h, pad_x, pad_y,
+                &detect_result_group, class_num, label_path_);
+        } else ret = -1;
+    } catch (const std::exception& error) {
+        fprintf(stderr, "[rknn_lite] postprocess exception: %s\n", error.what());
+        ret = -1;
+    } catch (...) {
+        fprintf(stderr, "[rknn_lite] postprocess unknown exception\n");
         ret = -1;
     }
 
-    // 9. 可选的可视化：直接在输入的原始图像上绘制矩形框
+    const int postprocess_ret = ret;
+    {
+        std::unique_lock<std::mutex> release_lock;
+        if (npu_mutex) release_lock = std::unique_lock<std::mutex>(*npu_mutex);
+        if (rknn_outputs_release(rkModel, io_num.n_output, outputs) < 0) return -1;
+    }
+
+    // 9. 可选的可视化：释放 RKNN 输出后再绘制，缩短 runtime 资源占用时间。
     if (draw_result)
     {
         char text[256];
@@ -692,13 +878,10 @@ int rknn_lite::interf(detect_result_group_t &detect_result_group, bool draw_resu
             
             // 针对不同模型 ID (如人员、安全帽等) 使用不同颜色的框
             cv::Scalar color = (id == 0) ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
-            rectangle(ori_img, cv::Point(x1, y1), cv::Point(det_result->box.right, det_result->box.bottom), color, 3);
+            rectangle(source, cv::Point(x1, y1), cv::Point(det_result->box.right, det_result->box.bottom), color, 3);
         }
     }
 
-    // 10. 资源释放：回收 RKNN 输出缓冲区，避免内存泄漏
-    const int postprocess_ret = ret;
-    rknn_outputs_release(rkModel, io_num.n_output, outputs);
     return postprocess_ret;
 }
 /**

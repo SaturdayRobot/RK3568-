@@ -874,7 +874,7 @@ std::string SqliteStore::escapeJson(const std::string& input) const {
         if (ch == '"') {
             out += "\\\"";   // 双引号转义：\"
         } else if (ch == '\\') {
-            out += "\\\\";   // 反斜杠转义：\\
+            out += "\\\\";   // 将单个反斜杠转义为两个反斜杠字符
         } else if (ch == '\n') {
             out += "\\n";    // 换行符转义：\n
         } else if (ch == '\r') {

@@ -16,6 +16,13 @@
 #include <algorithm>
 #include <iostream>
 
+namespace {
+int streamLoaderInterrupt(void* opaque) {
+    auto* loader = static_cast<StreamLoader*>(opaque);
+    return loader && loader->stopFlag.load(std::memory_order_relaxed) ? 1 : 0;
+}
+}
+
 // ============================================================================
 // Annex B 格式检测
 // ============================================================================
@@ -68,6 +75,7 @@ void mpp_decoder_frame_callback(void *buffer,
                                 int fd,
                                 void *data,
                                 size_t buffer_size,
+                                int64_t pts_us,
                                 int id,
                                 const std::shared_ptr<void>& frame_hold_token)
 {
@@ -77,17 +85,20 @@ void mpp_decoder_frame_callback(void *buffer,
     (void)data;
     (void)id;
 
-    // 格式安全校验：仅接受线性NV12
+    // RK3568 对 4:2:2 H.264 源会原生输出 NV16(0x2)，RGA 可直接转换为
+    // 最终画布的 NV12。仅拒绝压缩/tile/10-bit 及未知格式。
     const int base_format = format & MPP_FRAME_FMT_MASK;
     const bool linear = (format & (MPP_FRAME_FBC_MASK | MPP_FRAME_TILE_FLAG)) == 0;
-    if (!linear || base_format != MPP_FMT_YUV420SP) {
+    const bool supported = base_format == MPP_FMT_YUV420SP ||
+                           base_format == MPP_FMT_YUV422SP;
+    if (!linear || !supported) {
         std::cerr << "[stream_loader] unsupported MPP frame format=0x"
                   << std::hex << format << std::dec << ", drop frame" << std::endl;
         return;
     }
 
     // 帧参数有效性校验
-    if (fd <= 0 || width <= 0 || height <= 0 ||
+    if (fd < 0 || width <= 0 || height <= 0 ||
         width_stride < width || height_stride < height || buffer_size == 0) {
         std::cerr << "[stream_loader] invalid dma fd from MPP, drop frame" << std::endl;
         return;
@@ -100,7 +111,9 @@ void mpp_decoder_frame_callback(void *buffer,
     hw_desc.height = height;
     hw_desc.width_stride = width_stride;
     hw_desc.height_stride = height_stride;
+    hw_desc.format = base_format;
     hw_desc.buffer_size = buffer_size;
+    hw_desc.pts_us = pts_us;
     hw_desc.frame_hold = frame_hold_token;
 
     loader->onDecodedFrame(hw_desc);
@@ -128,7 +141,9 @@ bool StreamLoader::waitAndGetDecodedFrame(uint64_t& out_desc_id,
         return false; // stopFlag 触发的唤醒，无帧可消费
     }
 
-    // FIFO 出队
+    // 队列深度仅为2，按FIFO快速排空短突发。WSL/USB摄像头常把相邻帧成批
+    // 交付；若每次只取最新帧，会稳定误丢约4~6fps。真正过载时仍由
+    // onDecodedFrame() 的有界队列“丢最旧”策略阻止无限积压。
     const uint64_t desc_id = ready_queue_.front();
     ready_queue_.pop_front();
 
@@ -343,15 +358,17 @@ bool StreamLoader::read_frame()
             }
 
             // 提交给MPP硬件解码器（异步：解码结果通过回调返回）
-            bool decode_success = decoder.Decode(temp_pkt->data, temp_pkt->size, 0);
-            av_packet_unref(temp_pkt);
-
-            if (decode_success) {
-                status = 0;
-                return true;
-            } else {
-                std::this_thread::sleep_for(2ms);
+            // MPP 是异步流水线：packet 成功投喂后不一定在同一次调用中立即产出帧。
+            // “本次产出0帧”不是读取失败，下一 packet 会继续抽取已经完成的输出。
+            int64_t pts_us = -1;
+            if (temp_pkt->pts != AV_NOPTS_VALUE) {
+                pts_us = av_rescale_q(temp_pkt->pts,
+                    fmtCtx->streams[videoStreamIndex]->time_base, AV_TIME_BASE_Q);
             }
+            decoder.Decode(temp_pkt->data, temp_pkt->size, 0, pts_us);
+            av_packet_unref(temp_pkt);
+            status = 0;
+            return true;
         } else {
             // 非视频包直接丢弃
             av_packet_unref(temp_pkt);
@@ -414,6 +431,16 @@ int StreamLoader::open()
     // 防御式清理
     close();
 
+    // 预分配格式上下文并注册中断回调。TCP listen/accept 和网络读阻塞时，
+    // stop() 可通过 stopFlag 立即打断，避免服务停机卡死。
+    fmtCtx = avformat_alloc_context();
+    if (!fmtCtx) {
+        std::cerr << "alloc format context failed" << std::endl;
+        return -1;
+    }
+    fmtCtx->interrupt_callback.callback = streamLoaderInterrupt;
+    fmtCtx->interrupt_callback.opaque = this;
+
     // 分配临时数据包和编解码参数
     temp_pkt = av_packet_alloc();
     codecPar = avcodec_parameters_alloc();
@@ -430,20 +457,32 @@ int StreamLoader::open()
 
     av_dict_set(&options, "rtbufsize", rtbufsize_str.c_str(), 0);
     av_dict_set(&options, "start_time_realtime", 0, 0);
-    av_dict_set(&options, "rtsp_transport", rtsp_transport_.c_str(), 0);
+    const std::string url(stream_url ? stream_url : "");
+    const bool is_rtsp = url.rfind("rtsp://", 0) == 0 || url.rfind("rtsps://", 0) == 0;
+    if (is_rtsp) {
+        av_dict_set(&options, "rtsp_transport", rtsp_transport_.c_str(), 0);
+        av_dict_set(&options, "reorder_queue_size", "0", 0);
+    }
     av_dict_set(&options, "stimeout", stimeout_str.c_str(), 0);
+    av_dict_set(&options, "rw_timeout", stimeout_str.c_str(), 0);
     av_dict_set(&options, "max_delay", max_delay_str.c_str(), 0);
+    // MPEG-TS直连只需尽快识别H.264视频PID；限制探测窗口，避免默认数秒分析
+    // 给启动和断线重连额外制造延迟。
+    av_dict_set(&options, "probesize", "32768", 0);
+    av_dict_set(&options, "analyzeduration", "100000", 0);
+    av_dict_set(&options, "fpsprobesize", "2", 0);
     av_dict_set(&options, "buffer_size", "524288", 0);
     av_dict_set(&options, "fflags", "nobuffer", 0);       // 实时流不做额外探测缓存
     av_dict_set(&options, "flags", "low_delay", 0);        // 低延迟模式
-    av_dict_set(&options, "reorder_queue_size", "0", 0);   // 关闭B帧重排序队列
     av_dict_set(&options, "flush_packets", "1", 0);        // 每包立即刷新
-    av_dict_set(&options, "reconnect", "1", 0);            // 启用TCP自动重连
-    av_dict_set(&options, "reconnect_delay_max", "5", 0);  // 最大重连间隔5秒
+    if (is_rtsp) {
+        av_dict_set(&options, "reconnect", "1", 0);            // 启用TCP自动重连
+        av_dict_set(&options, "reconnect_delay_max", "5", 0);  // 最大重连间隔5秒
+    }
 
     // 打开输入流（RTSP协议协商）
     if (avformat_open_input(&fmtCtx, stream_url, NULL, &options) != 0) {
-        std::cout << "open rtsp stream failed" << std::endl;
+        std::cerr << "[StreamLoader] open input failed: " << url << std::endl;
         close();
         return -1;
     }
@@ -566,7 +605,38 @@ int StreamLoader::open()
  */
 void StreamLoader::operator()()
 {
+    const std::string url(stream_url ? stream_url : "");
+    const bool listener = url.find("listen=1") != std::string::npos ||
+                          url.find("mode=listener") != std::string::npos;
+    const int initial_backoff_ms = listener ? 200 : 1000;
+    const int max_backoff_ms = listener ? 1000 : 30000;
+    int backoff_ms = initial_backoff_ms;
+
+    auto waitInterruptibly = [this](int milliseconds) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(milliseconds);
+        while (!stopFlag.load(std::memory_order_relaxed) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    };
+
     while (stopFlag == false) {
+        if (!fmtCtx) {
+            if (open() != 0) {
+                if (stopFlag) break;
+                std::cout << "[StreamLoader] input unavailable, retry in " << backoff_ms
+                          << "ms (stream " << stream_loader_id << ")" << std::endl;
+                waitInterruptibly(backoff_ms);
+                backoff_ms = std::min(backoff_ms * 2, max_backoff_ms);
+                continue;
+            }
+            backoff_ms = initial_backoff_ms;
+            status = 0;
+            std::cout << "[StreamLoader] input connected (stream "
+                      << stream_loader_id << ")" << std::endl;
+        }
+
         try {
             if (!read_frame()) {
                 std::cout << "read frame error " << stream_loader_id << std::endl;
@@ -583,26 +653,9 @@ void StreamLoader::operator()()
 
             close();
 
-            // 指数退避重连循环
-            int backoff_ms = 1000;
-            const int max_backoff_ms = 30000;
-            while (open() != 0 && !stopFlag) {
-                std::cout << "Reconnect failed, retry in " << backoff_ms
-                          << "ms (stream " << stream_loader_id << ")" << std::endl;
-
-                // 分段睡眠，每100ms检查stopFlag，避免长时间阻塞无法退出
-                auto deadline = std::chrono::steady_clock::now()
-                                + std::chrono::milliseconds(backoff_ms);
-                while (std::chrono::steady_clock::now() < deadline && !stopFlag) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                if (stopFlag) break;
-
-                backoff_ms = std::min(backoff_ms * 2, max_backoff_ms);
-            }
-
-            if (stopFlag) break;
-            status = 0; // 重连成功，恢复正常状态
+            // listener 立即回到 accept；RTSP 客户端则使用短退避，实际 open
+            // 统一由循环顶部完成，避免两套重连状态机互相覆盖。
+            waitInterruptibly(backoff_ms);
         }
     }
 

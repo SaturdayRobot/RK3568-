@@ -163,9 +163,11 @@ bool MppH264Encoder::initialize(int width, int height, int fps, int bitrate) {
     // 原理：H.264 编码器使用整帧（含对齐填充行）进行运动搜索/补偿，
     // 如果填充区域是随机数据，会被当成"运动区域"导致压缩效率下降和编码伪影。
     if (auto* input = inputData()) {
+        mpp_buffer_sync_begin(frame_buffer_);
         const size_t y_size = static_cast<size_t>(stride_) * vertical_stride_;  // Y平面大小
         std::memset(input, 16, y_size);              // Y平面填充为16（黑电平），避免亮度噪点
         std::memset(input + y_size, 128, y_size / 2); // UV平面填充为128（无色差），避免彩色伪影
+        mpp_buffer_sync_end(frame_buffer_);
     }
 
     std::cout << "[MppEncoder] initialized H.264 " << width_ << 'x' << height_
@@ -211,6 +213,18 @@ uint8_t* MppH264Encoder::inputData() const {
  */
 int MppH264Encoder::inputFd() const {
     return frame_buffer_ ? mpp_buffer_get_fd(frame_buffer_) : -1;
+}
+
+size_t MppH264Encoder::inputSize() const {
+    return frame_buffer_ ? mpp_buffer_get_size(frame_buffer_) : 0;
+}
+
+bool MppH264Encoder::beginInputCpuAccess() {
+    return frame_buffer_ && mpp_buffer_sync_begin(frame_buffer_) == MPP_OK;
+}
+
+bool MppH264Encoder::endInputCpuAccess() {
+    return frame_buffer_ && mpp_buffer_sync_end(frame_buffer_) == MPP_OK;
 }
 
 /**
@@ -294,4 +308,9 @@ bool MppH264Encoder::encode(int64_t pts, std::vector<uint8_t>& output, bool& key
     mpp_packet_deinit(&packet);  // 释放码流包对象（输出数据已拷贝到 output）
 
     return !output.empty();  // 有输出数据即认为编码成功
+}
+
+bool MppH264Encoder::requestIdr() {
+    if (!ctx_ || !mpi_) return false;
+    return mpi_->control(ctx_, MPP_ENC_SET_IDR_FRAME, nullptr) == MPP_OK;
 }

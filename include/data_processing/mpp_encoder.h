@@ -19,6 +19,7 @@
 #pragma once
 
 #include <cstdint>   // 标准整数类型定义
+#include <cstddef>
 #include <vector>    // 用于存储编码后的码流头和码流数据
 
 #include "rk_mpi.h"  // Rockchip MPP 主接口头文件，包含 MppCtx/MppApi/MppEncCfg 等核心类型
@@ -96,6 +97,11 @@ public:
 
     int stride() const { return stride_; }               // 返回水平步长（=align16(width)），单位：字节
     int verticalStride() const { return vertical_stride_; } // 返回垂直步长（=align16(height)），单位：像素行
+    size_t inputSize() const;
+
+    /// RGA写入后、CPU绘制亮度OSD前后执行DMA cache同步。
+    bool beginInputCpuAccess();
+    bool endInputCpuAccess();
 
     /**
      * @brief 获取缓存的 SPS/PPS 头信息（H.264 Annex B 格式）
@@ -127,6 +133,9 @@ public:
      * @note 调用本函数前，外部必须已通过 inputData()/inputFd() 写入新的 YUV 数据
      */
     bool encode(int64_t pts, std::vector<uint8_t>& packet, bool& key_frame);
+
+    /// 请求下一帧立即编码为 IDR；必须由编码线程调用。
+    bool requestIdr();
 
 private:
     MppCtx ctx_ = nullptr;              // MPP 编码器上下文句柄，所有 MPP 操作的核心对象

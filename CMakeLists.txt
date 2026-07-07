@@ -241,6 +241,8 @@ install(PROGRAMS
     ${PROJECT_ROOT}/scripts/board_hardware_status.sh
     DESTINATION scripts)
 install(DIRECTORY ${PROJECT_ROOT}/docs/ DESTINATION docs)
+install(FILES ${PROJECT_ROOT}/README.md DESTINATION .)
+install(FILES ${PROJECT_ROOT}/windows/start_camera_publisher.ps1 DESTINATION windows)
 
 # 安装运行时 .so 文件（含符号链接），实现自包含部署
 file(GLOB FFMPEG_RUNTIME_FILES "${FFMPEG_LIB_DIR}/*.so*")

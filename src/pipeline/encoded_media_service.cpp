@@ -55,7 +55,7 @@ public:
         av_dict_set(&options, "flush_packets", "1", 0);        // 每包立即刷新（降低延迟）
         av_dict_set(&options, "avioflags", "direct", 0);       // 直接 I/O，减少缓冲
         av_dict_set(&options, "tcp_nodelay", "1", 0);          // TCP_NODELAY 选项（禁用 Nagle 算法）
-        av_dict_set(&options, "buffer_size", "262144", 0);     // 发送缓冲区 256KB
+        av_dict_set(&options, "buffer_size", "1048576", 0);    // 1MB，覆盖12Mbps码流的短时调度抖动
         av_dict_set(&options, "stimeout", "2000000", 0);       // 发送超时 2 秒（微秒）
         av_dict_set(&options, "rw_timeout", "2000000", 0);     // 读写超时 2 秒（微秒）
         int result = 0;
@@ -98,6 +98,8 @@ public:
         // 交错写入（对单流等同于 av_write_frame，但保持 API 兼容性）
         return av_interleaved_write_frame(context_, &output) >= 0;
     }
+
+    bool isOpen() const { return opened_ && context_ != nullptr; }
 
     // close(): 关闭 RTSP 连接，写入尾部并释放资源
     void close() {
@@ -148,6 +150,18 @@ bool EncodedMediaService::start() {
         encoder_.reset();
         return false;
     }
+    RgaPreprocessConfig direct_config;
+    direct_config.use_rga = true;
+    direct_config.strict_hardware = true;
+    direct_config.target_width = config_.width;
+    direct_config.target_height = config_.height;
+    direct_config.src_format = RgaPixelFormat::NV12;
+    direct_config.dst_format = RgaPixelFormat::NV12;
+    if (!direct_composer_.initialize(direct_config) || !direct_composer_.isRgaActive()) {
+        std::cerr << "[EncodedMedia] direct DMA compositor unavailable\n";
+        encoder_.reset();
+        return false;
+    }
     // 获取 H.264 extradata（SPS + PPS），供录像器和 RTSP 推流器使用
     codec_header_ = encoder_->header();
     // 启动录像器，传入 SPS/PPS 头部和分辨率
@@ -158,6 +172,8 @@ bool EncodedMediaService::start() {
     // 重置队列状态（清空残留数据）
     frame_queue_.reset();
     rtsp_queue_.reset();
+    force_next_idr_.store(false, std::memory_order_release);
+    processing_drops_.store(0, std::memory_order_relaxed);
     running_.store(true);                                                    // 设置运行标志
     // 启动编码线程：从帧队列取帧 -> RGA 转 NV12 -> MPP 编码 -> 分发到录像和 RTSP 队列
     encoder_thread_ = std::thread(&EncodedMediaService::encoderLoop, this);
@@ -183,7 +199,7 @@ void EncodedMediaService::stop() {
 // - frame: 已合成完成的画面帧（BGR888 格式）
 // - 非阻塞：帧被推入 Latest 模式队列，编码线程异步消费
 void EncodedMediaService::submitFrame(ComposedFrame frame) {
-    if (running_.load() && !frame.image.empty()) frame_queue_.push(std::move(frame));
+    if (running_.load() && frame.directDma()) frame_queue_.push(std::move(frame));
 }
 
 // trigger(): 触发录像事件（如移动侦测、AI 检测到目标等），转发给录像器
@@ -207,22 +223,12 @@ void EncodedMediaService::setRecordingCompletionCallback(
 }
 
 // encoderLoop(): 编码线程主循环
-// - 从帧队列取出 BGR 图像
-// - 通过 RGA 硬件转换为 NV12（H.264 编码器输入格式）
+// - 从帧队列取出两路DMA合成任务
+// - 通过RGA直接写入MPP NV12输入，并在Y平面绘制轻量OSD
 // - 调用 MPP 硬件编码器生成 H.264 码流
 // - 将编码包分发到录像器和 RTSP 队列
 void EncodedMediaService::encoderLoop() {
     utils::applyThreadRuntime("media_encoder", "media-encoder");  // 设置线程调度策略和名称
-    // 初始化 RGA 预处理器：BGR888 -> NV12 格式转换
-    RgaPreprocessor converter;
-    RgaPreprocessConfig rga_config;
-    rga_config.use_rga = true;                                               // 启用 RGA 硬件加速
-    rga_config.strict_hardware = true;                                       // 严格要求硬件支持
-    rga_config.target_width = config_.width;                                 // 目标宽度（编码分辨率）
-    rga_config.target_height = config_.height;                               // 目标高度
-    rga_config.src_format = RgaPixelFormat::BGR888;                          // 源格式：BGR888
-    rga_config.dst_format = RgaPixelFormat::NV12;                            // 目标格式：NV12（H.264 编码器输入）
-    const bool converter_ready = converter.initialize(rga_config) && converter.isRgaActive();
     int64_t encode_index = 0;                                                // 编码帧序号（传递给编码器）
     int64_t last_pts_ns = 0;                                                 // 上一帧的 PTS（纳秒）
     const int64_t default_duration = 1000000000LL / std::max(1, config_.fps); // 默认帧时长（纳秒）
@@ -238,16 +244,43 @@ void EncodedMediaService::encoderLoop() {
         if (frame.capture_mono_ns > 0 && now_ns >= frame.capture_mono_ns) {
             last_frame_age_ms_.store((now_ns - frame.capture_mono_ns) / 1000000LL); // 记录帧年龄（毫秒）
         }
-        // 跳过无效帧或非 BGR888 格式的帧，以及 RGA 不可用或转换失败的情况
-        if (frame.image.empty() || frame.image.type() != CV_8UC3 || !converter_ready ||
-            !converter.processToBuffer(frame.image, encoder_->inputData(), encoder_->stride(),
-                                       encoder_->verticalStride())) {
+        bool input_ready = false;
+        if (frame.directDma()) {
+            input_ready = direct_composer_.composeDmaToFdNv12(
+                frame.dma_layers, encoder_->inputFd(), config_.width, config_.height,
+                encoder_->stride(), encoder_->verticalStride(), encoder_->inputSize());
+            if (input_ready && frame.draw_luma_overlay) {
+                if (!encoder_->beginInputCpuAccess()) {
+                    input_ready = false;
+                } else {
+                    try {
+                        cv::Mat luma(config_.height, config_.width, CV_8UC1,
+                                     encoder_->inputData(), encoder_->stride());
+                        frame.draw_luma_overlay(luma);
+                    } catch (const std::exception& error) {
+                        std::cerr << "[EncodedMedia] luma OSD failed: " << error.what() << '\n';
+                        input_ready = false;
+                    } catch (...) {
+                        input_ready = false;
+                    }
+                    if (!encoder_->endInputCpuAccess()) input_ready = false;
+                }
+            }
+        }
+        if (!input_ready) {
+            processing_drops_.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
         // 调用 MPP 硬件编码器编码一帧
         std::vector<uint8_t> bytes;
         bool key_frame = false;
-        if (!encoder_->encode(encode_index++, bytes, key_frame)) continue;    // 编码失败，跳过
+        if (force_next_idr_.exchange(false, std::memory_order_acq_rel)) {
+            encoder_->requestIdr();
+        }
+        if (!encoder_->encode(encode_index++, bytes, key_frame)) {
+            processing_drops_.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         // 再次计算延迟（编码完成后），用于更精确的端到端延迟监控
         const int64_t encoded_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -272,7 +305,9 @@ void EncodedMediaService::encoderLoop() {
         // 分发：录像器始终接收（用于录像存储）
         recorder_.submitPacket(packet);
         // 如果启用 RTSP 推流，将编码包推入 RTSP 队列
-        if (config_.enable_rtsp) rtsp_queue_.push(std::move(packet));
+        if (config_.enable_rtsp) {
+            rtsp_queue_.push(std::move(packet));
+        }
     }
 }
 
@@ -296,10 +331,14 @@ void EncodedMediaService::rtspLoop() {
         if (current_drops != observed_drops) {
             std::cerr << "[RtspOutput] packet queue overflow, dropped="
                       << (current_drops - observed_drops)
-                      << ", resyncing at next IDR\n";
+                      << ", keeping connection and resyncing at next IDR\n";
             observed_drops = current_drops;                                    // 更新观察值
-            writer.close();                                                    // 关闭当前连接
-            waiting_for_key = true;                                            // 等待下一个 IDR 帧重新同步
+            // 不主动关闭 RTSP 连接。断开会让播放器黑屏并重新建链；保持连接、
+            // 丢弃到下一IDR只会短暂冻结，下一帧已由编码线程请求为IDR。
+            waiting_for_key = true;
+            // 一次观察可能合并了许多连续丢包，只生成一个 IDR，避免拥塞期间
+            // 每帧都被强制为大 I 帧，反过来进一步挤爆网络队列。
+            force_next_idr_.store(true, std::memory_order_release);
         }
         // 从 RTSP 队列取出编码包（200ms 超时）
         std::shared_ptr<recording::EncodedPacket> packet;
@@ -308,7 +347,7 @@ void EncodedMediaService::rtspLoop() {
         if (waiting_for_key && !packet->key_frame) continue;
         // 遇到关键帧且到了允许重连的时间：尝试重新建立 RTSP 连接
         if (waiting_for_key && std::chrono::steady_clock::now() >= next_reconnect &&
-            writer.open(config_, codec_header_)) {
+            (writer.isOpen() || writer.open(config_, codec_header_))) {
             waiting_for_key = false;                                           // 连接恢复，退出等待模式
             disconnected_event_sent = false;                                   // 重置断线事件标记
         }

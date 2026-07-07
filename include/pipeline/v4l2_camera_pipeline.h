@@ -25,6 +25,7 @@
 
 namespace pipeline {  // 管线命名空间
 class InferenceService;  // 前向声明推理服务类
+struct V4l2BufferRequeueState;
 
 /**
  * @struct V4l2CameraConfig
@@ -60,7 +61,7 @@ struct V4l2CameraConfig {
 class V4l2CameraPipeline {
 public:
     /// 帧输出回调函数类型：接收 BGR 帧、时间戳、monotonic 时间和覆盖层元数据
-    using FrameCallback = std::function<void(const cv::Mat&,
+    using FrameCallback = std::function<void(const FrameHub::DmaFrame&,
         std::chrono::system_clock::time_point, int64_t, const FrameHub::FrameOverlay&)>;
     /// 推理统计回调函数类型：接收推理统计数据
     using InferenceCallback = std::function<void(const data_lifecycle::InferenceStats&)>;
@@ -87,7 +88,7 @@ public:
     /// 注入共享推理服务（外部持有生命周期）
     void setInferenceService(InferenceService* service) { inference_service_ = service; }
 
-    /// 设置帧回调函数（处理完的 BGR 帧将由此回调输出）
+    /// 设置帧回调函数（带生命周期租约的原始DMA帧由此输出）
     void setFrameCallback(FrameCallback cb) { frame_callback_ = std::move(cb); }
 
     /// 设置推理统计回调函数
@@ -171,10 +172,12 @@ private:
     int height_stride_ = 0;            // 高度步长（像素），多平面格式的垂直对齐
     size_t size_image_ = 0;            // 单帧图像数据大小（字节）
     std::vector<Buffer> buffers_;      // V4L2 用户空间缓冲区列表
+    std::shared_ptr<V4l2BufferRequeueState> requeue_state_; // 延迟QBUF状态，独立于管线对象生命周期
 
     // ── RGA 预处理器 ──
     RgaPreprocessor camera_rga_;       // RGA 硬件加速预处理器实例
     bool camera_rga_ready_ = false;    // RGA 预处理是否初始化就绪
+    DmaColorSpace dma_color_space_ = DmaColorSpace::Bt709Limited;
 
     // ── 运行状态 ──
     std::atomic<bool> running_{false};       // 管线运行标志（所有线程的退出信号）

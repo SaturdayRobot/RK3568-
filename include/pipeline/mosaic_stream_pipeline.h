@@ -63,6 +63,7 @@ struct MosaicStreamConfig {
     bool sync_enabled = true;                 // 是否启用多路帧时间同步
     int sync_threshold_ms = 15;              // 帧同步的最大允许时间差（毫秒）
     int sync_queue_depth = 4;                // 帧同步历史队列深度（保留最近 N 帧用于对齐）
+    int source_stale_ms = 500;               // 超过该时长未更新则显示离线，禁止复用冻结旧帧
 };
 
 /**
@@ -183,12 +184,16 @@ private:
      */
     cv::Mat composeFrame();
 
+    /// 构建DMA直达编码器的合成任务；成功时不创建整帧BGR画布。
+    bool composeDirectFrame(ComposedFrame& output);
+
     /// RGA 将源 ROI 直接缩放写入完整画布 ROI，避免 tile 中间缓冲再 copyTo（单图拼接）
     bool rgaBlit(const cv::Mat& src, cv::Mat& canvas,
                  const cv::Rect& source_roi, const cv::Rect& destination_roi);
 
-    /// RGA 批量处理：resize + 直接拼接（一次性提交所有任务，减少 RGA 调用次数）
-    bool rgaBatchCompose(const std::vector<std::tuple<cv::Mat, int, int, cv::Rect>>& tasks,
+    /// RGA 批量处理：每项为(源图、源ROI、目标ROI)，一次 job 直接写入画布
+    bool rgaBatchCompose(
+                         const std::vector<std::tuple<cv::Mat, cv::Rect, cv::Rect>>& tasks,
                          cv::Mat& canvas);
 
     /// 探测 RGA 硬件可用性（仅调用一次，结果缓存到 rga_available_）
@@ -231,6 +236,7 @@ private:
     int64_t sync_delta_max_ns_ = 0;           // 同步时间差最大值（纳秒）
     int sync_fail_streak_ = 0;                // 连续同步失败次数（用于降级决策）
     int sync_skip_cooldown_ = 0;              // 跳过同步剩余帧数（避免超时拖累帧率）
+    std::vector<FrameHub::FrameSnapshot> last_synced_snapshot_; // 最近成功配对帧
 
     // ── 帧时间戳 ──
     int64_t last_composed_mono_ns_ = 0;       // 上次合成帧的 monotonic 时间戳（纳秒）

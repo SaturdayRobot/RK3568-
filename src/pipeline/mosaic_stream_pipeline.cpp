@@ -43,26 +43,26 @@ struct TileGeometry {
 // @param mode           缩放模式："cover"（裁切填满）或 "fit"（等比缩放留黑边）
 // @return               TileGeometry 结构体，包含源 ROI 和目标 ROI
 // ============================================================================
-TileGeometry tileGeometry(const cv::Mat& frame, const cv::Rect& tile,
+TileGeometry tileGeometry(int frame_width, int frame_height, const cv::Rect& tile,
                           bool preserve_aspect, const std::string& mode) {
     // 默认行为：源帧整体 → 目标 tile 拉伸填满（不保持宽高比）
-    TileGeometry out{cv::Rect(0, 0, frame.cols, frame.rows), tile};
-    if (!preserve_aspect || frame.empty()) return out; // 不保持宽高比或帧为空，直接返回默认布局
+    TileGeometry out{cv::Rect(0, 0, frame_width, frame_height), tile};
+    if (!preserve_aspect || frame_width <= 0 || frame_height <= 0) return out;
 
     // ---- "cover" 模式：裁切源帧以填满目标 tile ----
     if (mode == "cover") {
-        const double source_aspect = static_cast<double>(frame.cols) / frame.rows; // 源帧宽高比
+        const double source_aspect = static_cast<double>(frame_width) / frame_height;
         const double target_aspect = static_cast<double>(tile.width) / tile.height; // 目标宽高比
         if (source_aspect > target_aspect) {
             // 源帧比目标更宽，需要裁切左右两侧
             // 计算需要保留的宽度 = 高度 × 目标宽高比，并对齐到偶数像素（RGA 要求）
-            int crop_w = std::max(2, static_cast<int>(std::lround(frame.rows * target_aspect)) & ~1);
+            int crop_w = std::max(2, static_cast<int>(std::lround(frame_height * target_aspect)) & ~1);
             // 居中裁切
-            out.source = cv::Rect(((frame.cols - crop_w) / 2) & ~1, 0, crop_w, frame.rows);
+            out.source = cv::Rect(((frame_width - crop_w) / 2) & ~1, 0, crop_w, frame_height);
         } else {
             // 源帧比目标更高，需要裁切上下两侧
-            int crop_h = std::max(2, static_cast<int>(std::lround(frame.cols / target_aspect)) & ~1);
-            out.source = cv::Rect(0, ((frame.rows - crop_h) / 2) & ~1, frame.cols, crop_h);
+            int crop_h = std::max(2, static_cast<int>(std::lround(frame_width / target_aspect)) & ~1);
+            out.source = cv::Rect(0, ((frame_height - crop_h) / 2) & ~1, frame_width, crop_h);
         }
         return out;
     }
@@ -70,16 +70,55 @@ TileGeometry tileGeometry(const cv::Mat& frame, const cv::Rect& tile,
     // ---- "fit" 模式：等比缩放，留黑边 ----
     // 计算缩放因子（取较小的方向，确保整帧可见）
     const double scale = std::min(
-        static_cast<double>(tile.width) / frame.cols,
-        static_cast<double>(tile.height) / frame.rows);
+        static_cast<double>(tile.width) / frame_width,
+        static_cast<double>(tile.height) / frame_height);
     // 计算缩放后的实际尺寸（对齐偶数像素）
-    const int output_w = std::max(2, static_cast<int>(std::lround(frame.cols * scale)) & ~1);
-    const int output_h = std::max(2, static_cast<int>(std::lround(frame.rows * scale)) & ~1);
+    const int output_w = std::max(2, static_cast<int>(std::lround(frame_width * scale)) & ~1);
+    const int output_h = std::max(2, static_cast<int>(std::lround(frame_height * scale)) & ~1);
     // 目标区域在 tile 中居中放置（左右/上下留黑边）
     out.destination = cv::Rect(tile.x + (tile.width - output_w) / 2,
                                tile.y + (tile.height - output_h) / 2,
                                output_w, output_h);
     return out;
+}
+
+TileGeometry tileGeometry(const cv::Mat& frame, const cv::Rect& tile,
+                          bool preserve_aspect, const std::string& mode) {
+    return tileGeometry(frame.cols, frame.rows, tile, preserve_aspect, mode);
+}
+
+// 断流后 FrameHub 会保留最后一帧以等待快速重连。合流端只允许短暂复用，
+// 超时后把该源视为离线，避免冻结画面持续拉高端到端延迟指标。
+void invalidateStaleSnapshots(std::vector<FrameHub::FrameSnapshot>& snapshots,
+                              int stale_ms) {
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t stale_ns = static_cast<int64_t>(std::max(1, stale_ms)) * 1000000LL;
+    for (auto& item : snapshots) {
+        if (item.capture_mono_ns <= 0 || now_ns - item.capture_mono_ns <= stale_ns) continue;
+        item.frame.reset();
+        item.dma = {};
+        item.timestamp = {};
+        item.capture_mono_ns = 0;
+    }
+}
+
+cv::Rect logicalToRawRect(const cv::Rect& logical, int raw_width, int raw_height,
+                          int rotation) {
+    if (rotation == 90) {
+        return {logical.y, raw_height - logical.x - logical.width,
+                logical.height, logical.width};
+    }
+    if (rotation == 180) {
+        return {raw_width - logical.x - logical.width,
+                raw_height - logical.y - logical.height,
+                logical.width, logical.height};
+    }
+    if (rotation == 270) {
+        return {raw_width - logical.y - logical.height, logical.x,
+                logical.height, logical.width};
+    }
+    return logical;
 }
 
 // ============================================================================
@@ -391,6 +430,7 @@ bool MosaicStreamPipeline::loadFromIni(const std::string& path, MosaicStreamConf
     out.sync_enabled = cfg.getBool("sync", "enabled", out.sync_enabled);      // 是否启用帧同步
     out.sync_threshold_ms = cfg.getInt("sync", "threshold_ms", out.sync_threshold_ms); // 同步阈值（毫秒）
     out.sync_queue_depth = cfg.getInt("sync", "queue_depth", out.sync_queue_depth); // 同步队列深度
+    out.source_stale_ms = cfg.getInt("sync", "source_stale_ms", out.source_stale_ms); // 断流旧帧失效阈值
 
     // 将 input_mode 转为小写，统一格式
     std::transform(out.input_mode.begin(), out.input_mode.end(), out.input_mode.begin(), [](unsigned char c) {
@@ -606,10 +646,12 @@ void MosaicStreamPipeline::loop() {
         // 真正的拼图动作集中在 composeFrame()，这里保持主循环尽量薄。
         // 好处是后续如果要做"拼图算法替换 / 叠字 / 时间戳 / 版式切换"，
         // 只需聚焦 composeFrame() 一处。
-        cv::Mat mosaic = composeFrame();
+        ComposedFrame composed;
+        const bool direct = composeDirectFrame(composed);
+        if (!direct) continue;
 
         // ---- 提交合成帧 ----
-        if (!mosaic.empty() && media_service_ && media_service_->active()) {
+        if (media_service_ && media_service_->active()) {
             output_rate_.tick(); // 记录输出速率
             int64_t mono_ns = last_composed_mono_ns_; // 单调时钟纳秒时间戳
             int64_t real_ms = last_composed_real_ms_; // 真实时间毫秒时间戳
@@ -619,10 +661,224 @@ void MosaicStreamPipeline::loop() {
                     std::chrono::steady_clock::now().time_since_epoch()).count();
             }
             // 提交帧到媒体服务（内部执行 H264 编码 → RTSP 推流 / 录像归档）
-            media_service_->submitFrame(ComposedFrame{
-                std::move(mosaic), mono_ns, real_ms, ++composed_frame_id_});
+            composed.capture_mono_ns = mono_ns;
+            composed.capture_real_ms = real_ms;
+            composed.frame_id = ++composed_frame_id_;
+            media_service_->submitFrame(std::move(composed));
         }
     }
+}
+
+bool MosaicStreamPipeline::composeDirectFrame(ComposedFrame& output) {
+    if (!hub_) return false;
+    const std::vector<FrameSource> sources{
+        FrameSource::ExternalRtsp, FrameSource::Imx415};
+    std::vector<FrameHub::FrameSnapshot> snapshot;
+
+    if (config_.sync_enabled) {
+        FrameHub::SyncResult pair;
+        if (hub_->takeSynchronized(
+                sources[0], sources[1],
+                static_cast<int64_t>(std::max(1, config_.sync_threshold_ms)) * 1000000LL,
+                pair)) {
+            snapshot = {std::move(pair.first), std::move(pair.second)};
+            ++sync_pairs_;
+            sync_fail_streak_ = 0;
+            sync_skip_cooldown_ = 0;
+            sync_drop_first_ += pair.dropped_first;
+            sync_drop_second_ += pair.dropped_second;
+            const int64_t delta = std::llabs(pair.delta_ns);
+            sync_delta_total_ns_ += delta;
+            sync_delta_max_ns_ = std::max(sync_delta_max_ns_, delta);
+            last_synced_snapshot_ = snapshot;
+            if (sync_pairs_ % 100 == 0) {
+                std::cout << "[FrameSync] pairs=" << sync_pairs_
+                          << " avg_ms=" << (sync_delta_total_ns_ / sync_pairs_ / 1000000.0)
+                          << " max_ms=" << (sync_delta_max_ns_ / 1000000.0)
+                          << " drops=" << sync_drop_first_ << ',' << sync_drop_second_ << '\n';
+            }
+        } else {
+            sync_drop_first_ += pair.dropped_first;
+            sync_drop_second_ += pair.dropped_second;
+            ++sync_fail_streak_;
+            if (last_synced_snapshot_.size() == sources.size()) {
+                const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                int64_t newest_ns = 0;
+                for (const auto& item : last_synced_snapshot_) {
+                    newest_ns = std::max(newest_ns, item.capture_mono_ns);
+                }
+                // 短暂无新配对时重复上一组配对帧，不能退回“两路各取最新”。
+                // 超过500ms则认为源已停滞，回退当前快照以便离线状态及时显现。
+                if (newest_ns > 0 && now_ns - newest_ns <= 500000000LL) {
+                    snapshot = last_synced_snapshot_;
+                } else {
+                    last_synced_snapshot_.clear();
+                }
+            }
+            if (snapshot.empty()) hub_->snapshot(sources, snapshot);
+        }
+    } else {
+        hub_->snapshot(sources, snapshot);
+    }
+    if (snapshot.size() != sources.size()) return false;
+
+    invalidateStaleSnapshots(snapshot, config_.source_stale_ms);
+
+    updateTelemetry(snapshot);
+    last_composed_mono_ns_ = 0;
+    last_composed_real_ms_ = 0;
+    for (const auto& item : snapshot) {
+        if (item.capture_mono_ns > 0) {
+            last_composed_mono_ns_ = last_composed_mono_ns_ == 0
+                ? item.capture_mono_ns
+                : std::min(last_composed_mono_ns_, item.capture_mono_ns);
+        }
+        last_composed_real_ms_ = std::max(last_composed_real_ms_,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                item.timestamp.time_since_epoch()).count());
+    }
+
+    std::array<bool, 2> available{{snapshot[0].dma.valid(), snapshot[1].dma.valid()}};
+    const int available_count = static_cast<int>(available[0]) + static_cast<int>(available[1]);
+    if (available_count == 0) return false;
+
+    struct OverlayItem {
+        FrameHub::FrameOverlay overlay;
+        cv::Rect content;
+        cv::Rect tile;
+        cv::Rect source;
+    };
+    std::vector<OverlayItem> overlays;
+    overlays.reserve(2);
+    std::vector<std::pair<cv::Rect, std::string>> offline_tiles;
+
+    const int rows = config_.input_mode == "vertical" ? 2 : 1;
+    const int cols = config_.input_mode == "vertical" ? 1 : 2;
+    const int tile_w = config_.width / cols;
+    const int tile_h = config_.height / rows;
+    for (int i = 0; i < 2; ++i) {
+        // 源离线时仍保留固定槽位。自动把单路竖画面扩到整张横屏，会产生巨大的
+        // 左右黑边，也会让来源位置在重连瞬间跳变，运维端很难判断哪一路掉线。
+        const cv::Rect tile{
+            (i % cols) * tile_w, (i / cols) * tile_h,
+            i % cols == cols - 1 ? config_.width - (i % cols) * tile_w : tile_w,
+            i / cols == rows - 1 ? config_.height - (i / cols) * tile_h : tile_h};
+        if (!available[i]) {
+            offline_tiles.emplace_back(
+                tile, i == 0 ? "DIRECT INPUT OFFLINE" : "IMX415 OFFLINE");
+            continue;
+        }
+        const auto& dma = snapshot[i].dma;
+        TileGeometry geometry = tileGeometry(
+            dma.logicalWidth(), dma.logicalHeight(), tile,
+            config_.preserve_aspect_ratio, config_.aspect_mode);
+        // NV12目标ROI必须偶数对齐；居中偏移也向下对齐，最多改变1像素。
+        geometry.destination.x &= ~1;
+        geometry.destination.y &= ~1;
+        geometry.destination.width &= ~1;
+        geometry.destination.height &= ~1;
+        cv::Rect raw_source = logicalToRawRect(
+            geometry.source, dma.width, dma.height, dma.rotation);
+        raw_source.x &= ~1;
+        raw_source.y &= ~1;
+        raw_source.width &= ~1;
+        raw_source.height &= ~1;
+
+        RgaDmaComposeTask task;
+        task.src_fd = dma.fd;
+        task.src_width = dma.width;
+        task.src_height = dma.height;
+        task.src_width_stride = dma.width_stride;
+        task.src_height_stride = dma.height_stride;
+        task.src_buffer_size = dma.buffer_size;
+        task.src_format = dma.format == DmaPixelFormat::NV21
+            ? RgaPixelFormat::NV21
+            : dma.format == DmaPixelFormat::NV16
+                ? RgaPixelFormat::NV16 : RgaPixelFormat::NV12;
+        if (dma.color_space == DmaColorSpace::Bt601Full) {
+            task.color_space = RgaColorSpace::Bt601Full;
+        } else if (dma.color_space == DmaColorSpace::Bt601Limited) {
+            task.color_space = RgaColorSpace::Bt601Limited;
+        } else {
+            task.color_space = RgaColorSpace::Bt709Limited;
+        }
+        task.rotation = dma.rotation;
+        task.source_rect = raw_source;
+        task.destination_rect = geometry.destination;
+        task.lease = dma.lease;
+        output.dma_layers.push_back(std::move(task));
+        cv::Rect detection_source = geometry.source;
+        const int detection_width = snapshot[i].overlay.source_width;
+        const int detection_height = snapshot[i].overlay.source_height;
+        if (detection_width > 0 && detection_height > 0 &&
+            (detection_width != dma.logicalWidth() || detection_height != dma.logicalHeight())) {
+            const double sx = static_cast<double>(detection_width) / dma.logicalWidth();
+            const double sy = static_cast<double>(detection_height) / dma.logicalHeight();
+            detection_source = {
+                static_cast<int>(std::lround(geometry.source.x * sx)),
+                static_cast<int>(std::lround(geometry.source.y * sy)),
+                std::max(1, static_cast<int>(std::lround(geometry.source.width * sx))),
+                std::max(1, static_cast<int>(std::lround(geometry.source.height * sy)))};
+        }
+        overlays.push_back(OverlayItem{
+            snapshot[i].overlay, geometry.destination, tile, detection_source});
+    }
+    if (output.dma_layers.empty()) return false;
+
+    if (config_.draw_overlay) {
+        char status[256];
+        const double encoded_fps = media_service_ ? media_service_->encodedFps() : 0.0;
+        const double sent_fps = media_service_ ? media_service_->sentFps() : 0.0;
+        const double out_fps = sent_fps > 0.0 ? sent_fps : encoded_fps;
+        const int64_t latency = media_service_ ? media_service_->lastFrameAgeMs() : 0;
+        std::snprintf(status, sizeof(status),
+            "%.1f FPS  |  %lld ms  |  DROP %.2f%%  |  CPU %.0f%%  NPU %.0f%%  RGA %.0f%%  DDR %.0f%%",
+            out_fps, static_cast<long long>(latency), telemetry_.drop_percent,
+            telemetry_.cpu_percent, telemetry_.npu_percent,
+            telemetry_.rga_percent, telemetry_.ddr_percent);
+        const std::string status_text(status);
+        const bool vertical_layout = config_.input_mode == "vertical";
+        output.draw_luma_overlay = [items = std::move(overlays),
+                                    offline = std::move(offline_tiles),
+                                    status_text, vertical_layout](cv::Mat& luma) {
+            // 一像素低对比分隔线让两路边界清楚，但不抢夺检测框视觉焦点。
+            if (vertical_layout) {
+                cv::line(luma, {0, luma.rows / 2}, {luma.cols, luma.rows / 2},
+                         cv::Scalar(88), 1, cv::LINE_8);
+            } else {
+                cv::line(luma, {luma.cols / 2, 0}, {luma.cols / 2, luma.rows},
+                         cv::Scalar(88), 1, cv::LINE_8);
+            }
+            for (const auto& item : items) {
+                drawTileOverlay(luma, item.overlay, item.content, item.tile, item.source);
+            }
+            for (const auto& item : offline) {
+                const cv::Rect& tile = item.first;
+                const std::string& label = item.second;
+                int baseline = 0;
+                const double scale = std::clamp(tile.width / 1800.0, 0.45, 0.7);
+                const cv::Size size = cv::getTextSize(
+                    label, cv::FONT_HERSHEY_SIMPLEX, scale, 1, &baseline);
+                cv::putText(luma, label,
+                    {tile.x + std::max(8, (tile.width - size.width) / 2),
+                     tile.y + tile.height / 2},
+                    cv::FONT_HERSHEY_SIMPLEX, scale, cv::Scalar(150), 1, cv::LINE_AA);
+            }
+            const double font_scale = std::clamp(luma.cols / 3000.0, 0.46, 0.64);
+            int baseline = 0;
+            const cv::Size text_size = cv::getTextSize(
+                status_text, cv::FONT_HERSHEY_SIMPLEX, font_scale, 1, &baseline);
+            const cv::Rect bar(0, 0, luma.cols, text_size.height + baseline + 14);
+            cv::rectangle(luma, bar, cv::Scalar(16), cv::FILLED, cv::LINE_8);
+            cv::line(luma, {0, bar.height - 1}, {luma.cols, bar.height - 1},
+                     cv::Scalar(180), 1, cv::LINE_8);
+            cv::putText(luma, status_text,
+                {(luma.cols - text_size.width) / 2, text_size.height + 4},
+                cv::FONT_HERSHEY_SIMPLEX, font_scale, cv::Scalar(235), 1, cv::LINE_AA);
+        };
+    }
+    return true;
 }
 
 /**
@@ -639,7 +895,7 @@ void MosaicStreamPipeline::loop() {
  * 现在合并为 1 次批量提交。
  */
 bool MosaicStreamPipeline::rgaBatchCompose(
-    const std::vector<std::tuple<cv::Mat, int, int, cv::Rect>>& tasks,
+    const std::vector<std::tuple<cv::Mat, cv::Rect, cv::Rect>>& tasks,
     cv::Mat& canvas) {
     // 前置检查：RGA 可用性、运行时健康状态、任务非空
     if (!rga_available_ || !rgaRuntimeHealthy() || tasks.empty()) {
@@ -652,39 +908,41 @@ bool MosaicStreamPipeline::rgaBatchCompose(
     // imbeginJob 创建一个批处理会话，后续的所有 Task API 都会累积到此会话中
     im_job_handle_t job = imbeginJob(0);
     if (job == 0) {
-        reportRgaResult(false); // 批处理创建失败
+        // 某些旧 BSP 不支持 task API；让调用方退回单任务 RGA，不影响全局 RGA。
         return false;
     }
 
     bool success = true;
     std::vector<cv::Mat> continuous_srcs; // 保持连续源帧的生命周期（防止悬空指针）
-    std::vector<cv::Mat> tile_bufs;       // 保持临时 tile 缓冲的生命周期
     continuous_srcs.reserve(tasks.size());
-    tile_bufs.reserve(tasks.size());
 
     // 2. 准备画布的 RGA 缓冲描述
     rga_buffer_t rga_canvas{};
     rga_canvas.vir_addr = canvas.data;       // 画布虚拟地址（CPU 可访问）
     rga_canvas.width = canvas.cols;          // 画布宽度（像素）
     rga_canvas.height = canvas.rows;         // 画布高度（像素）
-    rga_canvas.wstride = canvas.cols;        // 行步长（像素），此处等于宽度（连续存放）
+    rga_canvas.wstride = static_cast<int>(canvas.step / canvas.elemSize());
     rga_canvas.hstride = canvas.rows;        // 列步长
     rga_canvas.format = RK_FORMAT_BGR_888;   // BGR 8-8-8 格式
 
-    // 3. 为每个任务添加 resize + translate 操作到批处理中
+    // 3. 每路用一个 process task 直接完成 crop + resize + 写入画布 ROI。
+    // 不创建 tile 中间图，也不再追加 translate task。
     for (const auto& task : tasks) {
         const cv::Mat& src = std::get<0>(task);   // 源帧
-        int dst_w = std::get<1>(task);             // 目标宽度
-        int dst_h = std::get<2>(task);             // 目标高度
-        const cv::Rect& roi = std::get<3>(task);   // 目标 ROI（在画布中的位置）
+        const cv::Rect& source_roi = std::get<1>(task);
+        const cv::Rect& destination_roi = std::get<2>(task);
 
-        if (src.empty()) {
-            continue; // 跳过空帧
+        if (src.empty() || src.type() != CV_8UC3 || source_roi.area() <= 0 ||
+            destination_roi.area() <= 0 ||
+            (source_roi & cv::Rect(0, 0, src.cols, src.rows)) != source_roi ||
+            (destination_roi & cv::Rect(0, 0, canvas.cols, canvas.rows)) != destination_roi) {
+            success = false;
+            break;
         }
 
         // 确保源帧内存连续（RGA 需要连续内存布局）
         cv::Mat continuous_src;
-        if (!src.isContinuous()) {
+        if (!src.isContinuous() || src.data != src.datastart) {
             continuous_src = src.clone(); // 非连续则克隆为连续
         } else {
             continuous_src = src;
@@ -696,32 +954,19 @@ bool MosaicStreamPipeline::rgaBatchCompose(
         rga_src.vir_addr = const_cast<void*>(static_cast<const void*>(continuous_src.data));
         rga_src.width = continuous_src.cols;
         rga_src.height = continuous_src.rows;
-        rga_src.wstride = continuous_src.cols;
+        rga_src.wstride = static_cast<int>(continuous_src.step / continuous_src.elemSize());
         rga_src.hstride = continuous_src.rows;
         rga_src.format = RK_FORMAT_BGR_888;
 
-        // 创建临时 tile 缓冲（中间缓冲，用于 resize 输出）
-        cv::Mat tile_buf(dst_h, dst_w, CV_8UC3);
-        tile_bufs.push_back(tile_buf); // 保持引用
-
-        rga_buffer_t rga_tile{};
-        rga_tile.vir_addr = tile_buf.data;
-        rga_tile.width = dst_w;
-        rga_tile.height = dst_h;
-        rga_tile.wstride = dst_w;
-        rga_tile.hstride = dst_h;
-        rga_tile.format = RK_FORMAT_BGR_888;
-
-        // 添加 resize 任务：src → tile（缩放操作）
-        IM_STATUS status = imresizeTask(job, rga_src, rga_tile, 0, 0, 0);
-        if (status != IM_STATUS_SUCCESS) {
-            success = false;
-            break;
+        const im_rect source_rect{
+            source_roi.x, source_roi.y, source_roi.width, source_roi.height};
+        const im_rect destination_rect{destination_roi.x, destination_roi.y,
+                                       destination_roi.width, destination_roi.height};
+        IM_STATUS status = imcheck(rga_src, rga_canvas, source_rect, destination_rect);
+        if (status == IM_STATUS_NOERROR) {
+            status = improcessTask(job, rga_src, rga_canvas, {}, source_rect,
+                                   destination_rect, {}, nullptr, IM_SYNC);
         }
-
-        // 添加 translate 任务：tile → canvas 对应位置（移位/拷贝到画布 ROI）
-        // roi.x, roi.y 是 tile 在 canvas 中的左上角坐标
-        status = imtranslateTask(job, rga_tile, rga_canvas, roi.x, roi.y);
         if (status != IM_STATUS_SUCCESS) {
             success = false;
             break;
@@ -731,7 +976,6 @@ bool MosaicStreamPipeline::rgaBatchCompose(
     // 任何任务添加失败，取消整个批处理
     if (!success) {
         imcancelJob(job);        // 取消批处理，释放 GPU 资源
-        reportRgaResult(false);  // 记录失败
         return false;
     }
 
@@ -739,7 +983,6 @@ bool MosaicStreamPipeline::rgaBatchCompose(
     // IM_SYNC 表示同步模式：硬件执行完毕后才返回
     IM_STATUS status = imendJob(job, IM_SYNC, 0, nullptr);
     if (status != IM_STATUS_SUCCESS) {
-        reportRgaResult(false);
         return false;
     }
 
@@ -783,7 +1026,8 @@ void MosaicStreamPipeline::updateTelemetry(
 
     // ---- 读取帧丢弃率 ----
     uint64_t captured = 0;
-    uint64_t dropped = media_service_ ? media_service_->droppedFrames() : 0; // 编码侧丢弃数
+    uint64_t dropped = media_service_
+        ? media_service_->droppedFrames() + media_service_->droppedRtspPackets() : 0;
     for (const auto& item : snapshot) {
         captured += item.overlay.frames_captured; // 各源采集帧数
         dropped += item.overlay.frames_dropped;   // 各源丢弃帧数
@@ -815,11 +1059,13 @@ void MosaicStreamPipeline::drawGlobalOverlay(cv::Mat& canvas) const {
     if (!config_.draw_overlay || canvas.empty()) return; // 不绘制叠加层或画布为空
 
     char text_buffer[256];
-    const double encoded_fps = media_service_ ? media_service_->encodedFps() : 0.0; // 编码输出 FPS
+    const double encoded_fps = media_service_ ? media_service_->encodedFps() : 0.0;
+    const double sent_fps = media_service_ ? media_service_->sentFps() : 0.0;
+    const double output_fps = sent_fps > 0.0 ? sent_fps : encoded_fps;
     const int64_t latency_ms = media_service_ ? media_service_->lastFrameAgeMs() : 0; // 最后一帧延迟（ms）
     std::snprintf(text_buffer, sizeof(text_buffer),
         "OUT %.1f FPS   LAT %lld ms   DROP %.2f%%   CPU %.0f%%   NPU %.0f%%   RGA %.0f%%   DDR %.0f%%",
-        encoded_fps, static_cast<long long>(latency_ms), telemetry_.drop_percent,
+        output_fps, static_cast<long long>(latency_ms), telemetry_.drop_percent,
         telemetry_.cpu_percent, telemetry_.npu_percent,
         telemetry_.rga_percent, telemetry_.ddr_percent);
 
@@ -872,11 +1118,12 @@ cv::Mat MosaicStreamPipeline::composeFrame() {
     cv::Mat& canvas = mosaic_canvas_[write_idx_.load(std::memory_order_relaxed)];
 
     // 预分配画布（仅首次或尺寸变化时分配）
-    if (canvas.empty() ||
-        canvas.cols != config_.width ||
-        canvas.rows != config_.height) {
+    const bool canvas_busy = canvas.u != nullptr && canvas.u->refcount > 1;
+    if (canvas.empty() || canvas.cols != config_.width ||
+        canvas.rows != config_.height || canvas_busy) {
         // 创建画布（创建后默认内容不确定，先填充黑色底色，避免部分区域出现花屏）
-        canvas.create(config_.height, config_.width, CV_8UC3);
+        // busy 时必须替换 Mat header；create() 对同尺寸共享缓冲不会重新分配。
+        canvas = cv::Mat(config_.height, config_.width, CV_8UC3);
     }
     // 如果某些 tile 没有新帧更新，保持旧内容不变，但新画布是空的，所以先填充黑色
     canvas.setTo(cv::Scalar(0, 0, 0)); // 黑色背景
@@ -938,6 +1185,8 @@ cv::Mat MosaicStreamPipeline::composeFrame() {
         hub_->snapshot(sources, snapshot);
         if (sync_skip_cooldown_ > 0) --sync_skip_cooldown_; // 冷却倒计时
     }
+
+    invalidateStaleSnapshots(snapshot, config_.source_stale_ms);
 
     // ---- 更新遥测数据 ----
     updateTelemetry(snapshot);
@@ -1004,6 +1253,10 @@ cv::Mat MosaicStreamPipeline::composeFrame() {
     }
 
     // ---- 多路源模式（标准 side_by_side / vertical） ----
+    std::array<TileGeometry, 2> geometries{};
+    std::array<bool, 2> tile_valid{{false, false}};
+    std::vector<std::tuple<cv::Mat, cv::Rect, cv::Rect>> rga_tasks;
+    rga_tasks.reserve(2);
     for (int i = 0; i < 2; ++i) {
         const int source_idx = tile_source_map[i];
         if (source_idx < 0 || source_idx >= static_cast<int>(snapshot.size())) {
@@ -1022,23 +1275,36 @@ cv::Mat MosaicStreamPipeline::composeFrame() {
         int r = i / cols; // 行索引
         int c = i % cols; // 列索引
         const cv::Rect tile(c * tile_w, r * tile_h, tile_w, tile_h); // tile 区域
-        const TileGeometry geometry = tileGeometry(
+        geometries[i] = tileGeometry(
             frame, tile, config_.preserve_aspect_ratio, config_.aspect_mode); // 计算几何映射
+        tile_valid[i] = true;
+        rga_tasks.emplace_back(frame, geometries[i].source, geometries[i].destination);
+    }
 
-        // RGA 硬件加速：crop + resize + blit 到画布
-        if (!rgaBlit(frame, canvas, geometry.source, geometry.destination)) {
-            // RGA 失败，回退到 CPU 路径（每 100 次打印一次告警）
+    // 两路 crop/resize/blit 合并成一个 RGA job，避免逐 tile 同步等待和重复排队。
+    const bool rga_composed = !rga_tasks.empty() && rgaBatchCompose(rga_tasks, canvas);
+    for (int i = 0; i < 2; ++i) {
+        if (!tile_valid[i]) continue;
+        const int source_idx = tile_source_map[i];
+        const cv::Mat& frame = *snapshot[source_idx].frame;
+        const auto& geometry = geometries[i];
+        const int r = i / cols;
+        const int c = i % cols;
+        const cv::Rect tile(c * tile_w, r * tile_h, tile_w, tile_h);
+
+        if (!rga_composed &&
+            !rgaBlit(frame, canvas, geometry.source, geometry.destination)) {
+            // 旧版 BSP 不支持 task API 时退回单任务 RGA；只有单任务也失败才走 CPU。
             static thread_local uint64_t rga_fail_count = 0;
             if (++rga_fail_count % 100 == 1) {
-                std::cerr << "[MosaicPipeline] RGA resize failed for tile " << i
+                std::cerr << "[MosaicPipeline] RGA compose failed"
                           << " (count=" << rga_fail_count << "), CPU fallback\n";
             }
             cv::resize(frame(geometry.source), tile_bufs_[i], geometry.destination.size(),
-                       0.0, 0.0, cv::INTER_AREA); // INTER_AREA 适合缩小
-            tile_bufs_[i].copyTo(canvas(geometry.destination)); // 拷贝到画布
+                       0.0, 0.0, cv::INTER_AREA);
+            tile_bufs_[i].copyTo(canvas(geometry.destination));
         }
 
-        // 绘制检测框叠加层
         if (config_.draw_overlay) {
             drawTileOverlay(canvas, snapshot[source_idx].overlay,
                             geometry.destination, tile, geometry.source);

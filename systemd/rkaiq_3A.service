@@ -5,18 +5,21 @@
 
 [Unit]
 Description=Rockchip RKAIQ 3A service for IMX415
-After=local-fs.target                  # 等待本地文件系统挂载（需读取 IQ 校准文件）
-Before=rk_video_ai.service             # 先于主推理服务启动
-ConditionPathExists=/usr/bin/rkaiq_3A_server                     # 3A 服务器必须存在
-ConditionPathExists=/etc/iqfiles/imx415_CMK-OT1522-FG3_CS-P1150-IRC-8M-FAU.json  # IQ 校准文件
+# 等待 IQ 文件所在的本地文件系统，并先于视频主服务启动。
+After=local-fs.target
+Before=rk_video_ai.service
+ConditionPathExists=/usr/bin/rkaiq_3A_server
+ConditionPathExists=/etc/iqfiles/imx415_CMK-OT1522-FG3_CS-P1150-IRC-8M-FAU.json
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/rkaiq_3A_server
 Restart=on-failure
-RestartSec=2                           # 快速重启（2 秒），3A 是关键基础服务
+# 3A 是关键基础服务，异常退出后快速恢复。
+RestartSec=2
 StandardOutput=journal
 StandardError=journal
 
 [Install]
-WantedBy=multi-user.target             # 多用户模式自动启动
+# 不要添加行尾注释，旧版systemd会将其误解析为target名称的一部分。
+WantedBy=multi-user.target

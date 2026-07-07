@@ -4,6 +4,7 @@
 #include <atomic>      // std::atomic 原子操作类型，线程安全的标志位和计数器
 #include <chrono>      // std::chrono 时间工具
 #include <cstdint>     // int64_t / uint64_t 等定宽整数
+#include <functional>
 #include <memory>      // std::unique_ptr 独占所有权智能指针
 #include <string>      // std::string 字符串类型
 #include <thread>      // std::thread 线程管理
@@ -15,6 +16,7 @@
 // 项目内部头文件
 #include "pipeline/bounded_queue.hpp"          // BoundedQueue 线程安全有界队列
 #include "pipeline/pipeline_metrics.h"         // RateCounter 帧率计数器
+#include "pipeline/rga_preprocessor.h"
 #include "data_processing/mpp_encoder.h"       // MppH264Encoder Rockchip MPP 硬编码器
 #include "storage/event_recorder.h"            // EventRecorder 事件录像管理器
 
@@ -42,13 +44,16 @@ struct EncodedMediaConfig {
  * @struct ComposedFrame
  * @brief 待编码的合成帧
  *
- * 由 MosaicStreamPipeline 合成后提交给 EncodedMediaService 进行编码推流。
+ * 由MosaicStreamPipeline提交DMA图层，编码线程直接合成到MPP NV12输入。
  */
 struct ComposedFrame {
-    cv::Mat image;               // 合成后的 BGR 图像
+    std::vector<RgaDmaComposeTask> dma_layers; // 首选：直接合成到MPP NV12输入
+    std::function<void(cv::Mat&)> draw_luma_overlay; // 在NV12 Y平面绘制OSD，不复制整帧
     int64_t capture_mono_ns = 0;  // 原始采集 monotonic 时间戳（纳秒）
     int64_t capture_real_ms = 0;  // 原始采集真实时间（毫秒，epoch）
     uint64_t frame_id = 0;        // 帧唯一标识 ID
+
+    bool directDma() const { return !dma_layers.empty(); }
 };
 
 /**
@@ -116,7 +121,9 @@ public:
     bool active() const { return running_.load(std::memory_order_acquire); }
 
     /// 编码帧队列累计丢弃数
-    uint64_t droppedFrames() const { return frame_queue_.dropCount(); }
+    uint64_t droppedFrames() const {
+        return frame_queue_.dropCount() + processing_drops_.load(std::memory_order_relaxed);
+    }
 
     /// RTSP 包队列累计丢弃数
     uint64_t droppedRtspPackets() const { return rtsp_queue_.dropCount(); }
@@ -145,10 +152,13 @@ private:
     std::thread encoder_thread_;                                   // 编码线程句柄
     std::thread rtsp_thread_;                                      // RTSP 推流线程句柄
     std::unique_ptr<MppH264Encoder> encoder_;                      // MPP H.264 硬件编码器
+    RgaPreprocessor direct_composer_;                              // DMA源直接合成到编码器NV12输入
     std::vector<uint8_t> codec_header_;                            // H.264 编码头（SPS/PPS），RTSP 初始化时发送
     RateCounter encoded_rate_;                                     // 编码帧率计数器
     RateCounter sent_rate_;                                        // 推流帧率计数器
     std::atomic<int64_t> last_frame_age_ms_{0};                   // 最后帧年龄（毫秒），原子操作，线程安全
+    std::atomic<bool> force_next_idr_{false};                     // RTSP线程请求编码线程生成一次IDR
+    std::atomic<uint64_t> processing_drops_{0};                  // RGA合成/OSD/编码失败丢帧
 };
 
 }  // namespace pipeline

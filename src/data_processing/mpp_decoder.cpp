@@ -175,11 +175,9 @@ int MppDecoder::Init(int video_type, int fps, void *userdata, int id)
     }
 
     // === 步骤5：设置输出超时参数 ===
-    // MPP_SET_OUTPUT_TIMEOUT：设置 decode_get_frame 的超时时间（毫秒）
-    // 当解码器内部无可用帧时，该调用最多等待 output_timeout_ms 毫秒后返回 MPP_ERR_TIMEOUT。
-    // 降低此值可减少 get_frame 空转等待带来的 CPU 抖动——超时后线程可立即执行其他任务。
-    // 注意：底层硬件解码器可能不支持此参数，不支持时仅打印日志，不影响功能。
-    RK_S64 output_timeout_ms = 2;      // 2毫秒超时：平衡响应速度和CPU占用
+    // 实时流采用非阻塞输出：当前 packet 暂时没有产出帧时立即返回，继续投喂
+    // 下一 packet。若逐包等待硬件输出，会把 30fps 拉流降到约 18fps并持续积压。
+    RK_S64 output_timeout_ms = 0;
     ret = mpp_mpi->control(mpp_ctx, MPP_SET_OUTPUT_TIMEOUT, &output_timeout_ms);
     if (ret)
     {
@@ -236,7 +234,7 @@ int MppDecoder::SetCallback(MppDecoderFrameCallback callback)
     return 0;
 }
 
-int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos)
+int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos, int64_t pts_us)
 {
     // 快速失败：空数据或无有效长度时直接返回，避免无效调用进入 MPP
     if (pkt_data == NULL || pkt_size <= 0)
@@ -259,6 +257,7 @@ int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos)
     mpp_packet_set_size(packet, pkt_size);   // 设置 packet 的缓冲区总容量
     mpp_packet_set_pos(packet, pkt_data);    // 设置 packet 的当前读/写游标位置
     mpp_packet_set_length(packet, pkt_size); // 设置从游标开始的有效数据长度
+    mpp_packet_set_pts(packet, pts_us);       // 透传码流时基，供异步输出帧恢复真实节奏
     if (pkt_eos)
         mpp_packet_set_eos(packet);          // 标记为流结束：解码器收到后将排空内部缓冲帧
     else
@@ -266,7 +265,7 @@ int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos)
 
     // === 解码循环的控制常量 ===
     const RK_S32 kMaxPutRetry = 30;       // put_packet 最大重试次数（缓冲区满时）
-    const RK_S32 kMaxGetTimeoutRetry = 6; // get_frame 单次调用的超时重试上限
+    const RK_S32 kMaxGetTimeoutRetry = 0; // 实时链不在单个 packet 上等待输出
     const RK_S32 kMaxDrainPerRound = 16;  // 每轮最多拉取帧数，防止单次调用长时间占用线程
 
     RK_S32 put_retry = 0;      // put_packet 当前重试计数
@@ -395,10 +394,10 @@ int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos)
                     ret = mpp_buffer_group_clear(data->frm_grp);
                 }
 
-                // 配置缓冲区组限制：每个缓冲区大小 = buf_size，最多 8 个
-                // 8 个缓冲区的依据：解码器内部 DPB 最多同时持有约 5~7 帧（含参考帧+当前帧+重排序帧）
+                // PTS定时发布可能短暂持有最多8个提前解出的帧；加上H.264 DPB参考帧，
+                // 固定16帧上限可吸收WSL/USB突发，同时仍严格限制DMA内存占用。
                 if (!ret)
-                    ret = mpp_buffer_group_limit_config(data->frm_grp, buf_size, 8);
+                    ret = mpp_buffer_group_limit_config(data->frm_grp, buf_size, 16);
 
                 // MPP_DEC_SET_INFO_CHANGE_READY：通知解码器 info-change 已处理完毕
                 // 解码器收到此信号后将继续输出正常解码帧
@@ -436,6 +435,7 @@ int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos)
                     int dma_fd = frame_buf ? mpp_buffer_get_fd(frame_buf) : -1;
                     // mpp_buffer_get_size：获取缓冲区总大小（字节）
                     size_t dma_size = frame_buf ? mpp_buffer_get_size(frame_buf) : 0;
+                    const int64_t frame_pts_us = mpp_frame_get_pts(frame);
 
                     // --- 帧生命周期管理 ---
                     // 使用 shared_ptr 的自定义删除器实现 RAII 风格的帧生命周期管理：
@@ -464,6 +464,7 @@ int MppDecoder::Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos)
                              dma_fd,                // DMA-BUF fd（-1=不可用）
                              data_vir,              // 虚拟地址（NULL=仅可通过fd访问）
                              dma_size,              // 缓冲区大小
+                             frame_pts_us,           // 输入码流PTS（微秒）
                              this->id,              // 解码器ID
                              frame_hold_token);     // 帧生命周期令牌
                     frame = NULL;  // 所有权已转移给 shared_ptr 删除器，本地指针置空防止 double-free

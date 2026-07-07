@@ -22,6 +22,7 @@ auto.crt
 build/
 build-*/
 cmake-build-*/
+staging-*/
 deploy/*/
 deploy/*.tar.gz
 deploy/*.zip

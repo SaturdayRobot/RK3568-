@@ -1,6 +1,5 @@
 #!/bin/sh
-# 板端服务安装脚本：安装 Debian 依赖包、部署 systemd unit、配置文件
-# 部署后服务默认不自动开机启动；需要时使用 start_board_services.sh 手动启动
+# 板端服务安装脚本：依赖服务开机自启，主推理程序保持手动启动。
 set -eu
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -49,16 +48,19 @@ install -m 0644 "$ROOT/systemd/rkaiq_3A.service" /etc/systemd/system/rkaiq_3A.se
 
 systemctl daemon-reload
 
-# apt 安装 mosquitto 时可能自动启用服务——统一 stop + disable
-# 确保板卡重启后本项目及配套服务不会自动运行
+# 主程序按用户要求不设开机自启；基础依赖必须随系统启动。
 systemctl disable --now rk_video_ai.service 2>/dev/null || true
-systemctl disable --now rkaiq_3A.service 2>/dev/null || true
-systemctl disable --now mosquitto.service 2>/dev/null || true
+systemctl enable --now mosquitto.service
+if [ -x /usr/bin/rkaiq_3A_server ] && \
+   [ -f /etc/iqfiles/imx415_CMK-OT1522-FG3_CS-P1150-IRC-8M-FAU.json ]; then
+    systemctl enable --now rkaiq_3A.service
+fi
 
 # --- 输出部署摘要 ---
 echo "Mosquitto: mqtt://127.0.0.1:1883"
-echo "External input:   rtsp://192.168.137.1:8554/camera"
+echo "External input:   tcp://0.0.0.0:5000 (Windows FFmpeg MPEG-TS)"
 echo "WSL publish:      rtsp://192.168.137.1:8554/result"
 echo "WSL WebRTC page:  http://192.168.137.1:8889/result"
-echo "Autostart: disabled"
+echo "Autostart dependencies: mosquitto + rkaiq_3A"
+echo "Autostart main program: disabled"
 echo "Manual start: $ROOT/scripts/start_board_services.sh"

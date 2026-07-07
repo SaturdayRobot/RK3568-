@@ -20,6 +20,8 @@
 // 标准库头文件
 #include <cstdint>   // uint8_t / int 等定宽类型
 #include <atomic>    // std::atomic<bool> 原子布尔值
+#include <memory>
+#include <vector>
 
 // OpenCV 头文件
 #include <opencv2/core/mat.hpp>  // cv::Mat 图像矩阵类型
@@ -67,6 +69,7 @@ enum class RgaPixelFormat : uint8_t {
     RGB888,        // RGB 8-8-8 格式（深度学习模型常用输入格式）
     NV12,          // YUV 4:2:0 半平面格式（摄像头/编码器标准输出格式）
     NV21,          // YUV 4:2:0 半平面格式（NV12 的 UV 交换版本）
+    NV16,          // YUV 4:2:2 半平面格式（MPP 对 4:2:2 视频的原生输出）
     RGBA8888,      // RGBA 8-8-8-8 带 alpha 通道
     BGRA8888,      // BGRA 8-8-8-8 带 alpha 通道
 };
@@ -98,6 +101,21 @@ struct RgaPreprocessConfig {
     RgaPixelFormat src_format = RgaPixelFormat::BGR888;  // 源图像像素格式
     RgaPixelFormat dst_format = RgaPixelFormat::RGB888;  // 目标图像像素格式（模型期望格式）
     RgaColorSpace color_space = RgaColorSpace::Bt709Limited; // YUV↔RGB 颜色空间转换矩阵
+};
+
+struct RgaDmaComposeTask {
+    int src_fd = -1;
+    int src_width = 0;
+    int src_height = 0;
+    int src_width_stride = 0;
+    int src_height_stride = 0;
+    size_t src_buffer_size = 0;
+    RgaPixelFormat src_format = RgaPixelFormat::NV12;
+    RgaColorSpace color_space = RgaColorSpace::Bt709Limited;
+    int rotation = 0;
+    cv::Rect source_rect;      // 原始DMA坐标；当前旋转路径应传完整源区域
+    cv::Rect destination_rect; // 输出NV12画布坐标，所有边界须偶数对齐
+    std::shared_ptr<void> lease;
 };
 
 /**
@@ -165,6 +183,30 @@ public:
                        cv::Mat& dst, int src_height_stride = 0,
                        size_t src_buffer_size = 0);
 
+    /**
+     * @brief 将源 DMA-BUF 直接 letterbox 到目标 DMA-BUF
+     *
+     * 目标缓冲区必须是 RGB888，且由调用方保证在本方法返回前后均有效。
+     * 方法内部使用同步 RGA 提交；返回 true 时源缓冲已经读取完毕，可以归还
+     * 给采集端，目标缓冲则必须保持到后续消费者完成。
+     */
+    bool processFdToFdLetterbox(int src_fd, int src_width, int src_height,
+                                int src_stride, int src_height_stride,
+                                size_t src_buffer_size, RgaPixelFormat src_format,
+                                int dst_fd, int dst_width, int dst_height,
+                                int dst_stride, int dst_height_stride,
+                                size_t dst_buffer_size,
+                                int resized_width, int resized_height,
+                                int offset_x, int offset_y,
+                                bool clear_padding,
+                                uint8_t padding_value = 114);
+
+    /// 多路NV12/NV21 DMA在一个RGA job内旋转/缩放/拼接，直接写MPP NV12输入。
+    bool composeDmaToFdNv12(const std::vector<RgaDmaComposeTask>& tasks,
+                            int dst_fd, int dst_width, int dst_height,
+                            int dst_stride, int dst_height_stride,
+                            size_t dst_buffer_size);
+
     /// BGR 图像硬件旋转
     /// @param src 输入 BGR 图像
     /// @param dst 输出旋转后的 BGR 图像
@@ -189,6 +231,17 @@ private:
     /// RGA DMA-BUF fd 输入实现（零拷贝路径的核心实现）
     bool processRgaFd(int src_fd, int src_width, int src_height, int src_stride,
                       cv::Mat& dst, int src_height_stride, size_t src_buffer_size);
+
+    bool processRgaFdToFdLetterbox(int src_fd, int src_width, int src_height,
+                                   int src_stride, int src_height_stride,
+                                   size_t src_buffer_size, RgaPixelFormat src_format,
+                                   int dst_fd, int dst_width, int dst_height,
+                                   int dst_stride, int dst_height_stride,
+                                   size_t dst_buffer_size,
+                                   int resized_width, int resized_height,
+                                   int offset_x, int offset_y,
+                                   bool clear_padding,
+                                   uint8_t padding_value);
 
     RgaPreprocessConfig config_;      // 预处理配置副本
     bool initialized_   = false;      // 是否已完成初始化

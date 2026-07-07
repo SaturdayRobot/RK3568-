@@ -8,6 +8,7 @@
 #include <memory>      // std::unique_ptr 独占所有权智能指针
 #include <mutex>       // std::mutex 互斥锁
 #include <set>         // std::set 集合容器，用于类别白名单过滤
+#include <shared_mutex> // std::shared_mutex 服务生命周期读写锁
 #include <string>      // std::string 字符串类型
 #include <vector>      // std::vector 动态数组容器
 
@@ -16,6 +17,7 @@
 
 // 项目内部头文件
 #include "data_processing/postprocess.h"       // detect_result_group_t 检测结果结构体
+#include "pipeline/rga_preprocessor.h"         // RgaPixelFormat DMA输入格式
 #include "rknn_api.h"                          // Rockchip NPU API (rknn_core_mask 等)
 
 class rknn_lite;                               // 前向声明 RKNN Lite 推理运行时封装类
@@ -58,8 +60,8 @@ struct InferenceResult {
  * @struct InferenceFrameDesc
  * @brief DMA-BUF 帧描述符
  *
- * 用于零拷贝推理路径：不经过 CPU 拷贝像素数据，
- * 直接将 DMA-BUF fd 传递给 RGA/NPU。
+ * 用于零 CPU 像素拷贝推理路径：源 FD 由 RGA 读取，结果直接写入
+ * RKNN 绑定的输入 DMA-BUF。
  */
 struct InferenceFrameDesc {
     int dma_fd = -1;           // DMA-BUF 文件描述符（-1 表示无效/未设置）
@@ -68,9 +70,11 @@ struct InferenceFrameDesc {
     int width_stride = 0;      // 行步长（字节），对齐后的每行尺寸
     int height_stride = 0;     // 高度步长（像素），对齐后的垂直尺寸
     size_t buffer_size = 0;    // 缓冲区总大小（字节）
+    RgaPixelFormat pixel_format = RgaPixelFormat::NV12; // NV12/NV16 DMA格式
     int scheduler_slot = 0;    // 调度槽位：0 = A路 (external_rtsp), 1 = B路 (imx415)
+    std::shared_ptr<void> frame_hold; // 保持源 DMA-BUF 到所有模型 RGA 读取完成
     /// 检查描述符是否有效（DMA fd 有效且尺寸非零）
-    bool valid() const { return dma_fd > 0 && width > 0 && height > 0; }
+    bool valid() const { return dma_fd >= 0 && width > 0 && height > 0; }
 };
 
 /**
@@ -170,13 +174,13 @@ public:
      * @param desc DMA-BUF 帧描述符
      * @return 推理结果
      *
-     * 通过 RGA 导入 DMA-BUF fd 到 NPU 可访问的物理连续内存，
-     * 避免 GPU→CPU 拷贝开销。
+     * 通过 RGA 把源 DMA-BUF 转换到 RKNN 输入 DMA-BUF，避免中间
+     * cv::Mat 和 rknn_inputs_set 输入复制。
      */
-    InferenceResult inferFromFd(const InferenceFrameDesc& desc);
+    InferenceResult inferFromFd(InferenceFrameDesc desc);
 
     /// 推理服务是否已初始化并可用
-    bool isReady() const { return initialized_; }
+    bool isReady() const { return initialized_.load(std::memory_order_acquire); }
 
     /// 获取运行统计的原子快照
     ModelRuntimeStats statsSnapshot() const;
@@ -197,11 +201,12 @@ private:
      *
      * 完成 RGA 预处理、模型推理、后处理的全流程。
      */
-    InferenceResult inferImpl(const cv::Mat* frame, const InferenceFrameDesc* desc, int scheduler_slot);
+    InferenceResult inferImpl(const cv::Mat* frame, InferenceFrameDesc* desc, int scheduler_slot);
 
     InferenceServiceConfig config_;                                    // 推理服务配置副本
-    bool initialized_ = false;                                         // 初始化完成标志
+    std::atomic<bool> initialized_{false};                              // 初始化完成标志
     std::array<std::unique_ptr<rknn_lite>, kMaxInferenceModels> models_; // 各模型的运行时实例（unique_ptr 独占所有权）
+    mutable std::shared_mutex lifecycle_mutex_;                          // 防止推理期间释放模型
     std::mutex npu_mutex_;                                             // NPU 全局互斥锁（确保推理串行执行）
     std::array<std::mutex, kMaxInferenceModels> model_mutex_;          // 每个模型的独立锁（保护模型特定状态）
     utils::NpuThermalManager* thermal_mgr_ = nullptr;                  // NPU 热管理器指针（非持有）

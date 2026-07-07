@@ -11,6 +11,7 @@
 #include "pipeline/frame_hub.h"
 
 #include <cstdlib>
+#include <limits>
 
 namespace pipeline {
 
@@ -41,6 +42,7 @@ void FrameHub::update(FrameSource source, cv::Mat&& frame,
         // 对当前源槽位加锁，保证写入操作的原子性
         std::lock_guard<std::mutex> lock(slot.mtx);
         slot.frame = std::move(holder);          // 更新最新帧指针（共享所有权）
+        slot.dma = {};
         slot.timestamp = timestamp;               // 记录系统时钟时间戳
         slot.capture_mono_ns = capture_mono_ns;   // 记录单调时钟纳秒时间戳
         slot.overlay = std::move(overlay);        // 更新叠加层信息（检测框等）
@@ -48,7 +50,7 @@ void FrameHub::update(FrameSource source, cv::Mat&& frame,
         slot.has_frame = true;                    // 标记该槽位已有有效帧数据
         // 将当前快照推入同步队列，供 takeSynchronized() 进行跨源时间对齐
         slot.sync_queue.push_back(FrameSnapshot{
-            slot.frame, timestamp, capture_mono_ns, slot.seq, slot.overlay});
+            slot.frame, {}, timestamp, capture_mono_ns, slot.seq, slot.overlay});
         // 维持同步队列深度上限，超出则丢弃最旧帧，防止内存无限增长
         while (slot.sync_queue.size() > sync_queue_depth_.load()) {
             slot.sync_queue.pop_front();
@@ -59,6 +61,42 @@ void FrameHub::update(FrameSource source, cv::Mat&& frame,
     slot.cv.notify_all();//告知等待线程有新帧了-->也就是其他需要获取这个帧数据的其他应用程序线程可以来这里读取数据了
     //到这里上游视频管线线程的任务就完成了，但是对于图像来说这里是相关后处理（推流）起点，处于待发状态，由其他应用程序
     //调用FrameHub::get()来获取这个帧数据并进行后续处理（推流）了
+}
+
+void FrameHub::updateDma(FrameSource source, DmaFrame frame,
+                         std::chrono::system_clock::time_point timestamp,
+                         int64_t capture_mono_ns,
+                         FrameOverlay overlay) {
+    if (!frame.valid()) return;
+    const size_t idx = static_cast<size_t>(source);
+    auto& slot = slots_[idx];
+    {
+        std::lock_guard<std::mutex> lock(slot.mtx);
+        slot.frame.reset();
+        slot.dma = std::move(frame);
+        slot.timestamp = timestamp;
+        slot.capture_mono_ns = capture_mono_ns;
+        slot.overlay = std::move(overlay);
+        ++slot.seq;
+        slot.has_frame = true;
+        slot.sync_queue.push_back(FrameSnapshot{
+            nullptr, slot.dma, timestamp, capture_mono_ns, slot.seq, slot.overlay});
+        while (slot.sync_queue.size() > sync_queue_depth_.load()) {
+            slot.sync_queue.pop_front();
+            ++slot.sync_overflow_drops;
+        }
+    }
+    slot.cv.notify_all();
+}
+
+void FrameHub::clear() {
+    for (auto& slot : slots_) {
+        std::lock_guard<std::mutex> lock(slot.mtx);
+        slot.frame.reset();
+        slot.dma = {};
+        slot.sync_queue.clear();
+        slot.has_frame = false;
+    }
 }
 
 // get(shared_ptr): 以共享指针形式读取指定源的最新帧，避免深拷贝
@@ -131,6 +169,7 @@ void FrameHub::snapshot(const std::vector<FrameSource>& sources,
         out[i].timestamp = slot.timestamp;             // 系统时间戳
         out[i].capture_mono_ns = slot.capture_mono_ns; // 单调时钟纳秒
         out[i].overlay = slot.overlay;                 // 叠加层元数据
+        out[i].dma = slot.dma;
         // 仅当有有效帧时才共享像素指针，否则保持 nullptr
         if (slot.has_frame && slot.frame && !slot.frame->empty()) {
             out[i].frame = slot.frame;
@@ -155,31 +194,45 @@ bool FrameHub::takeSynchronized(FrameSource first, FrameSource second,
     out.dropped_second += right.sync_overflow_drops;
     left.sync_overflow_drops = 0;   // 清零已统计的丢弃计数
     right.sync_overflow_drops = 0;
-    // 只要两边队列都非空，就持续尝试匹配
+    if (left.sync_queue.empty() || right.sync_queue.empty()) return false;
+
+    // 按时间顺序消费，不能每次跳到“最新合法帧”。MPP可能一次回调两帧；若
+    // 直接选最新帧，会固定删除同批的前一帧，最终虽然编码仍显示25fps，画面却
+    // 只有约15~17个独立帧。队列本身有严格深度上限，因此顺序配对不会无限积压。
     while (!left.sync_queue.empty() && !right.sync_queue.empty()) {
-        // 计算两个队列队首帧的采集时间差
-        const int64_t delta = left.sync_queue.front().capture_mono_ns -
-                              right.sync_queue.front().capture_mono_ns;
-        // 若时间差在阈值内，则匹配成功
+        const int64_t left_ns = left.sync_queue.front().capture_mono_ns;
+        const int64_t right_ns = right.sync_queue.front().capture_mono_ns;
+        if (left_ns <= 0) {
+            left.sync_queue.pop_front();
+            ++out.dropped_first;
+            continue;
+        }
+        if (right_ns <= 0) {
+            right.sync_queue.pop_front();
+            ++out.dropped_second;
+            continue;
+        }
+
+        const int64_t delta = left_ns - right_ns;
         if (std::llabs(delta) <= threshold_ns) {
-            out.first = std::move(left.sync_queue.front());   // 取出左侧匹配帧
-            out.second = std::move(right.sync_queue.front()); // 取出右侧匹配帧
-            out.delta_ns = delta;                             // 记录实际时间差
-            left.sync_queue.pop_front();   // 从队列中移除已匹配帧
+            out.first = std::move(left.sync_queue.front());
+            out.second = std::move(right.sync_queue.front());
+            out.delta_ns = delta;
+            left.sync_queue.pop_front();
             right.sync_queue.pop_front();
             return true;
         }
-        // 左边帧更旧：丢弃左边队首，继续尝试匹配
-        if (delta < 0) {
+
+        // 较旧一侧的队首已经超出允许窗口，后续对侧帧只会更新，不可能再匹配。
+        if (left_ns < right_ns) {
             left.sync_queue.pop_front();
-            ++out.dropped_first;  // 统计因时间不匹配丢弃的帧数
+            ++out.dropped_first;
         } else {
-            // 右边帧更旧：丢弃右边队首
             right.sync_queue.pop_front();
             ++out.dropped_second;
         }
     }
-    return false;  // 至少有一边队列为空，无法继续匹配
+    return false;
 }
 
 // seq(): 查询指定源的当前帧序号，用于轻量轮询判断是否有新帧

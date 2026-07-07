@@ -63,6 +63,7 @@ using MppDecoderFrameCallback = std::function<void(void *userdata,
                                                    int fd,
                                                    void *data,
                                                    size_t buffer_size,
+                                                   int64_t pts_us,
                                                    int id,
                                                    const std::shared_ptr<void>& frame_hold_token)>;
 
@@ -162,7 +163,7 @@ public:
      *
      * @note 该函数非完全线程安全：同一 Decoder 的多个 Decode() 调用须外部串行化
      */
-    int Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos);
+    int Decode(uint8_t *pkt_data, int pkt_size, int pkt_eos, int64_t pts_us = -1);
 
     /**
      * @brief 重置解码器内部状态
