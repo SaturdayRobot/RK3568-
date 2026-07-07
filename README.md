@@ -141,7 +141,6 @@ ss -lntp | grep ':5000 '
 管理员 PowerShell：
 
 ```powershell
-usbipd detach --busid 2-1
 winget install --id Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements
 ```
 
