@@ -50,5 +50,3 @@ model/rk3568/*.onnx
 model/rk3568/*_dataset.txt
 model/rk3568/calibration/
 
-# Local documents
-docs/
